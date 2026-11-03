@@ -1,0 +1,3 @@
+torch>=2.2
+numpy
+polyscope>=2.3
