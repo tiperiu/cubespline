@@ -250,6 +250,55 @@ def _corner_values(cube, cells, R, level):
     return g[inv].reshape(len(cells), 8)
 
 
+def _mesh_cells(cells: np.ndarray, g: np.ndarray, R: int):
+    """Marching cubes on integer cells (nc, 3) of a resolution-R lattice with corner
+    values g (nc, 8) (already relative to the level; < 0 is inside).
+
+    Returns (F, a_ijk, b_ijk, n_cases, n_ambiguous_faces), or None if no triangles.
+    Vertex v lies on the lattice edge a_ijk[v] -> b_ijk[v] (integer lattice points);
+    the caller decides how to place it along the edge.
+    """
+    # ---- case per cell: corner config + asymptotic decider on ambiguous faces
+    inside = g < 0                                                      # (nc, 8)
+    config = (inside * (1 << np.arange(8))).sum(1)
+    fv = g[:, FACE_CORNERS]                                             # (nc, 6, 4)
+    fin = inside[:, FACE_CORNERS]
+    amb = (fin[..., 0] == fin[..., 2]) & (fin[..., 1] == fin[..., 3]) & (fin[..., 0] != fin[..., 1])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        saddle = (fv[..., 0] * fv[..., 2] - fv[..., 1] * fv[..., 3]) / \
+                 (fv[..., 0] + fv[..., 2] - fv[..., 1] - fv[..., 3])
+    joined = amb & (saddle < 0)                                         # inside corners connected
+    decisions = (joined * (1 << np.arange(6))).sum(1)
+    case_key = config * 64 + decisions
+
+    # ---- global lattice-edge id for the 12 edges of every cell
+    a_pts = cells[:, None, :] + CORNER_IJK[CUBE_EDGES[:, 0]][None]      # (nc, 12, 3)
+    a_idx = a_pts[..., 0] + (R + 1) * (a_pts[..., 1] + (R + 1) * a_pts[..., 2])
+    edge_gid = a_idx * 3 + EDGE_AXIS[None, :]                           # (nc, 12)
+
+    tri_list = []
+    ukeys, inv = np.unique(case_key, return_inverse=True)
+    for u, key in enumerate(ukeys):
+        tris = _case_triangles(int(key) // 64, int(key) % 64)
+        if not tris:
+            continue
+        sel = np.nonzero(inv == u)[0]
+        tri_list.append(edge_gid[sel][:, np.asarray(tris)].reshape(-1, 3))
+    if not tri_list:
+        return None
+    tri_gid = np.concatenate(tri_list, 0)
+
+    # ---- weld: one vertex per lattice edge
+    ugid, F = np.unique(tri_gid, return_inverse=True)
+    F = F.reshape(-1, 3).astype(np.int64)
+    axis = ugid % 3
+    a_lin = ugid // 3
+    a_ijk = np.stack([a_lin % (R + 1), (a_lin // (R + 1)) % (R + 1), a_lin // (R + 1) ** 2], 1)
+    b_ijk = a_ijk + np.eye(3, dtype=np.int64)[axis]
+
+    return F, a_ijk, b_ijk, len(ukeys), int(amb.sum())
+
+
 def extract_topology(cube: Cube, depth: int = 3, level: float = 0.0) -> Topology:
     """Subdivide `cube` `depth` times (2^depth cells per axis), prune sub-cubes
     the surface cannot touch, and run marching cubes on the rest."""
@@ -291,43 +340,10 @@ def extract_topology(cube: Cube, depth: int = 3, level: float = 0.0) -> Topology
     if not len(cells) or len(per_level) <= depth:
         return empty
 
-    # ---- case per cell: corner config + asymptotic decider on ambiguous faces
-    inside = g < 0                                                      # (nc, 8)
-    config = (inside * (1 << np.arange(8))).sum(1)
-    fv = g[:, FACE_CORNERS]                                             # (nc, 6, 4)
-    fin = inside[:, FACE_CORNERS]
-    amb = (fin[..., 0] == fin[..., 2]) & (fin[..., 1] == fin[..., 3]) & (fin[..., 0] != fin[..., 1])
-    with np.errstate(divide="ignore", invalid="ignore"):
-        saddle = (fv[..., 0] * fv[..., 2] - fv[..., 1] * fv[..., 3]) / \
-                 (fv[..., 0] + fv[..., 2] - fv[..., 1] - fv[..., 3])
-    joined = amb & (saddle < 0)                                         # inside corners connected
-    decisions = (joined * (1 << np.arange(6))).sum(1)
-    case_key = config * 64 + decisions
-
-    # ---- global lattice-edge id for the 12 edges of every cell
-    a_pts = cells[:, None, :] + CORNER_IJK[CUBE_EDGES[:, 0]][None]      # (nc, 12, 3)
-    a_idx = a_pts[..., 0] + (R + 1) * (a_pts[..., 1] + (R + 1) * a_pts[..., 2])
-    edge_gid = a_idx * 3 + EDGE_AXIS[None, :]                           # (nc, 12)
-
-    tri_list = []
-    ukeys, inv = np.unique(case_key, return_inverse=True)
-    for u, key in enumerate(ukeys):
-        tris = _case_triangles(int(key) // 64, int(key) % 64)
-        if not tris:
-            continue
-        sel = np.nonzero(inv == u)[0]
-        tri_list.append(edge_gid[sel][:, np.asarray(tris)].reshape(-1, 3))
-    if not tri_list:
+    meshed = _mesh_cells(cells, g, R)
+    if meshed is None:
         return empty
-    tri_gid = np.concatenate(tri_list, 0)
-
-    # ---- weld: one vertex per lattice edge
-    ugid, F = np.unique(tri_gid, return_inverse=True)
-    F = F.reshape(-1, 3).astype(np.int64)
-    axis = ugid % 3
-    a_lin = ugid // 3
-    a_ijk = np.stack([a_lin % (R + 1), (a_lin // (R + 1)) % (R + 1), a_lin // (R + 1) ** 2], 1)
-    b_ijk = a_ijk + np.eye(3, dtype=np.int64)[axis]
+    F, a_ijk, b_ijk, n_cases, n_amb = meshed
 
     ua = torch.as_tensor(a_ijk, dtype=dt, device=dev) / R
     ub = torch.as_tensor(b_ijk, dtype=dt, device=dev) / R
@@ -335,8 +351,8 @@ def extract_topology(cube: Cube, depth: int = 3, level: float = 0.0) -> Topology
     lo = cube.lo.detach()
     pa, pb = lo + ua * cube.size, lo + ub * cube.size
 
-    stats.update({"vertices": len(ugid), "faces": len(F),
-                  "cases": len(ukeys), "ambiguous_faces": int(amb.sum())})
+    stats.update({"vertices": len(a_ijk), "faces": len(F),
+                  "cases": n_cases, "ambiguous_faces": n_amb})
     return Topology(F, pa, pb, Wa, Wb, cells, depth, level, lo.clone(), cube.size, stats)
 
 
@@ -345,6 +361,36 @@ def marching_cubes(cube: Cube, depth: int = 3, level: float = 0.0):
     V is a torch tensor (nv, 3) attached to cube.values' graph; F is int64 (nf, 3)."""
     topo = extract_topology(cube, depth, level)
     return topo.vertices(cube.values), topo.F, topo
+
+
+def mesh_from_grid(G: np.ndarray, lo=-1.0, size=2.0, level: float = 0.0):
+    """Iso-surface of an arbitrary function sampled on a regular grid.
+
+    G: (R+1, R+1, R+1) values indexed [i, j, k] on the lattice of [lo, lo+size]^3.
+    Same case table, face decider and welding as extract_topology, so the mesh is
+    watertight inside the box and oriented towards increasing G. Vertices are
+    placed by linear interpolation along lattice edges (exact for trilinear data,
+    an approximation otherwise). Returns numpy (V, F).
+    """
+    G = np.asarray(G, dtype=np.float64) - level
+    R = G.shape[0] - 1
+    tol = SNAP_REL * max(float(np.abs(G).max()), 1e-300)
+    G = np.where(np.abs(G) < tol, 0.0, G)
+    ijk = np.stack(np.meshgrid(*[np.arange(R)] * 3, indexing="ij"), -1).reshape(-1, 3)
+    corners = ijk[:, None, :] + CORNER_IJK[None]
+    g = G[corners[..., 0], corners[..., 1], corners[..., 2]]             # (R^3, 8)
+    n_in = (g < 0).sum(1)
+    mixed = (n_in > 0) & (n_in < 8)
+    meshed = _mesh_cells(ijk[mixed], g[mixed], R)
+    if meshed is None:
+        return np.zeros((0, 3)), np.zeros((0, 3), np.int64)
+    F, a_ijk, b_ijk, _, _ = meshed
+    ga = G[a_ijk[:, 0], a_ijk[:, 1], a_ijk[:, 2]]
+    gb = G[b_ijk[:, 0], b_ijk[:, 1], b_ijk[:, 2]]
+    t = np.clip(ga / (ga - gb), 0.0, 1.0)
+    lo = np.broadcast_to(np.asarray(lo, dtype=np.float64), (3,))
+    V = lo + (a_ijk + t[:, None] * (b_ijk - a_ijk)) * (size / R)
+    return V, F
 
 
 # ----------------------------------------------------------------------------

@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.idea/
+.polyscope.ini
+imgui.ini
+*.obj
+.DS_Store

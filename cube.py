@@ -111,6 +111,22 @@ class Cube(nn.Module):
         x = torch.as_tensor(x, dtype=self.dtype, device=self.lo.device)
         return self.basis_local(self.to_local(x))
 
+    def basis_gradient(self, x) -> torch.Tensor:
+        """Spatial gradient of the 8 basis functions at world points x (..., 3)
+        -> (..., 3, 8), so that  gradient(x) = basis_gradient(x) @ values.
+        Like `basis`, it does not depend on the values (the gradient of the
+        field is linear in them too)."""
+        x = torch.as_tensor(x, dtype=self.dtype, device=self.lo.device)
+        u = self.to_local(x)
+        X, Y, Z = u[..., 0], u[..., 1], u[..., 2]
+        one = torch.ones_like(X)
+        wx, wy, wz = (torch.stack([1 - t, t], -1) for t in (X, Y, Z))
+        dw = torch.stack([-one, one], -1) / self.size          # d/dt of [1-t, t]
+
+        def outer(a, b, c):                                     # -> (..., 8), n = i + 2j + 4k
+            return (c[..., :, None, None] * b[..., None, :, None] * a[..., None, None, :]).reshape(*X.shape, 8)
+        return torch.stack([outer(dw, wy, wz), outer(wx, dw, wz), outer(wx, wy, dw)], dim=-2)
+
     def evaluate(self, x, values: torch.Tensor | None = None) -> torch.Tensor:
         """Field value at world points x (..., 3) -> (...).
         `values` overrides the stored ones (e.g. a batch of candidates (B, 8)

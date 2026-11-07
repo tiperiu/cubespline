@@ -11,9 +11,15 @@ Usage:
     python viewer.py                                  # preset "bowl", depth 4
     python viewer.py --preset saddle --depth 6
     python viewer.py --values -1 1 1 1 1 1 1 -1 --depth 5 --level 0.2
+    python viewer.py --load fit.json                  # result of optimize.py
 """
 
 import argparse
+import glob
+import json
+import os
+import subprocess
+import sys
 import time
 
 import numpy as np
@@ -28,6 +34,7 @@ BACK_COLOR = (0.95, 0.70, 0.45)        # inside (f < level) side of the surface
 EDGE_COLOR = (0.10, 0.10, 0.10)
 CUBE_COLOR = (0.25, 0.25, 0.25)
 CELL_COLOR = (0.45, 0.60, 0.45)
+TARGET_COLOR = (0.95, 0.55, 0.30)      # same as the optimize.py live view
 MAX_CELLS_DRAWN = 40000
 
 
@@ -47,8 +54,14 @@ class State:
     show_cells = False
     show_vertices = False
     slider_range = 2.0
-    preset_names = list(PRESETS)
-    preset_idx = preset_names.index("bowl")
+    # combo-box entries: the presets, then every fit loaded from a fit.json
+    # entry = {"name", "values", "depth" (or None), "target" (or None), "path" (or None)}
+    entries = [{"name": k, "values": list(v), "depth": None, "target": None, "path": None}
+               for k, v in PRESETS.items()]
+    entry_idx = list(PRESETS).index("bowl")
+    fit_path = "fit.json"
+    show_target = True
+    target_name = None      # target of the loaded fit currently drawn
     obj_path = "cubespline_mesh.obj"
     cube = None
     topo = None
@@ -82,6 +95,157 @@ def rebuild():
     draw_corners()
     draw_cells()
     apply_display_options()
+
+
+# --------------------------------------------------------------------------
+# Fits written by optimize.py
+# --------------------------------------------------------------------------
+def entry_names():
+    return [e["name"] for e in S.entries]
+
+
+def select_entry(idx):
+    """Show combo-box entry idx: its values, its depth and (for a fit) its target."""
+    S.entry_idx = idx
+    e = S.entries[idx]
+    S.values = list(e["values"])
+    if e["depth"] is not None:
+        S.depth = int(e["depth"])
+    S.slider_range = max(S.slider_range, float(np.abs(S.values).max()) * 1.2)
+    draw_target(e["target"])
+
+
+def clean_path(text):
+    """Turn whatever was pasted into a plain path: strip spaces and quotes, a
+    file:// prefix, and a trailing newline; expand ~."""
+    p = (text or "").strip().strip('"').strip("'").strip()
+    if p.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+        p = unquote(urlparse(p).path)
+    return os.path.expanduser(p)
+
+
+def clipboard_text():
+    """System clipboard as text. ImGui text fields in Polyscope often ignore
+    Cmd+V on macOS, so read the clipboard directly."""
+    try:
+        if sys.platform == "darwin":
+            return subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=2).stdout
+        if sys.platform.startswith("win"):
+            return subprocess.run(["powershell", "-command", "Get-Clipboard"],
+                                  capture_output=True, text=True, timeout=5).stdout
+        for cmd in (["xclip", "-o", "-selection", "clipboard"], ["wl-paste", "-n"]):
+            try:
+                return subprocess.run(cmd, capture_output=True, text=True, timeout=2).stdout
+            except FileNotFoundError:
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return psim.GetClipboardText() or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def choose_file(start_dir="."):
+    """Native file picker; returns a path or "" if cancelled."""
+    start_dir = os.path.abspath(start_dir)
+    try:
+        if sys.platform == "darwin":
+            script = ('POSIX path of (choose file with prompt "Choose a fit (.json)" '
+                      f'default location (POSIX file "{start_dir}"))')
+            r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+            return r.stdout.strip()
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        path = filedialog.askopenfilename(initialdir=start_dir, title="Choose a fit",
+                                          filetypes=[("fit files", "*.json"), ("all files", "*")])
+        root.destroy()
+        return path or ""
+    except Exception as e:  # noqa: BLE001
+        print(f"  file picker unavailable: {e}")
+        return ""
+
+
+def load_fit(path):
+    """Read a fit.json from optimize.py, add it to the combo box and show it."""
+    path = clean_path(path)
+    try:
+        with open(path) as fh:
+            fit = json.load(fh)
+        values = [float(v) for v in fit["values"]]
+        assert len(values) == 8
+    except Exception as e:  # noqa: BLE001
+        S.message = f"Could not load {path}: {e}"
+        print(S.message)
+        return False
+    target = fit.get("target")
+    name = f"fit: {os.path.basename(path)}" + (f" ({os.path.basename(str(target))})" if target else "")
+    entry = {"name": name, "values": values, "depth": fit.get("depth"), "target": target,
+             "path": os.path.abspath(path), "error": fit.get("final_error") or fit.get("metrics")}
+    # reloading the same file replaces its entry instead of adding a duplicate
+    for i, e in enumerate(S.entries):
+        if e["path"] == entry["path"]:
+            S.entries[i] = entry
+            break
+    else:
+        S.entries.append(entry)
+        i = len(S.entries) - 1
+    select_entry(i)
+    rms = fit.get("metrics", {}).get("rms")
+    S.message = f"Loaded {os.path.basename(path)}: target {target}" + (f", rms {rms:.3g}" if rms else "")
+    print(S.message)
+    return True
+
+
+def scan_fits(folder="."):
+    """Add every fit-looking .json in `folder` to the combo box (does not select them)."""
+    for path in sorted(glob.glob(os.path.join(folder, "*.json"))):
+        try:
+            with open(path) as fh:
+                fit = json.load(fh)
+            if not (isinstance(fit, dict) and len(fit.get("values", [])) == 8):
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        if any(e["path"] == os.path.abspath(path) for e in S.entries):
+            continue
+        target = fit.get("target")
+        S.entries.append({"name": f"fit: {os.path.basename(path)}" + (f" ({os.path.basename(str(target))})" if target else ""),
+                          "values": [float(v) for v in fit["values"]], "depth": fit.get("depth"),
+                          "target": target, "path": os.path.abspath(path),
+                          "error": fit.get("final_error") or fit.get("metrics")})
+
+
+def draw_target(target):
+    """Draw the surface a fit was optimized against (built-in name or mesh path)."""
+    if target == S.target_name:
+        if ps.has_surface_mesh("target"):
+            ps.get_surface_mesh("target").set_enabled(S.show_target)
+        return
+    if ps.has_surface_mesh("target"):
+        ps.remove_surface_mesh("target")
+    S.target_name = target
+    if not target:
+        return
+    try:
+        import optimize as O
+        if target in O.FUNCTIONS or target == "trilinear":
+            t = O.builtin_target(target, n=500)
+        elif os.path.isfile(target):
+            V, F = O.load_obj(target) if target.lower().endswith(".obj") else __import__("igl").read_triangle_mesh(target)
+            t = O.target_from_mesh(V, F, name=target, n=500)
+        else:
+            print(f"  target '{target}' not found; showing the fit only")
+            return
+    except Exception as e:  # noqa: BLE001
+        print(f"  could not rebuild target '{target}': {e}")
+        return
+    m = ps.register_surface_mesh("target", t.V, t.F, color=TARGET_COLOR, transparency=0.45)
+    m.set_back_face_policy("identical")
+    m.set_enabled(S.show_target)
 
 
 def draw_cube_frame():
@@ -155,10 +319,33 @@ def ui():
 
     # ---- Corner values ----
     if psim.CollapsingHeader("Corner values", psim.ImGuiTreeNodeFlags_DefaultOpen):
-        changed, S.preset_idx = psim.Combo("preset", S.preset_idx, S.preset_names)
+        changed, idx = psim.Combo("preset / fit", S.entry_idx, entry_names())
         if changed:
-            S.values = list(PRESETS[S.preset_names[S.preset_idx]])
+            select_entry(idx)
             dirty = True
+        _, S.fit_path = psim.InputText("fit file", S.fit_path)
+        if psim.Button("Browse..."):
+            start = os.path.dirname(clean_path(S.fit_path)) or "."
+            p = choose_file(start if os.path.isdir(start) else ".")
+            if p:
+                S.fit_path = p
+                dirty |= load_fit(p)
+        psim.SameLine()
+        if psim.Button("Paste"):
+            text = clean_path(clipboard_text())
+            if text:
+                S.fit_path = text
+                S.message = "Pasted path; press Load fit"
+            else:
+                S.message = "Clipboard is empty"
+        psim.SameLine()
+        if psim.Button("Load fit"):
+            dirty |= load_fit(S.fit_path)
+        psim.SameLine()
+        if psim.Button("Rescan *.json"):
+            n = len(S.entries)
+            scan_fits(os.path.dirname(os.path.abspath(S.fit_path)) or ".")
+            S.message = f"Found {len(S.entries) - n} new fit file(s)"
         r = S.slider_range
         for n in range(8):
             i, j, k = CORNER_IJK[n]
@@ -218,6 +405,9 @@ def ui():
         c, S.show_vertices = psim.Checkbox("Vertices", S.show_vertices); changed |= c
         c, S.show_cube = psim.Checkbox("Cube", S.show_cube); changed |= c
         c, S.show_corners = psim.Checkbox("Corner values (blue < level < red)", S.show_corners); changed |= c
+        c, S.show_target = psim.Checkbox("Target of the fit (orange)", S.show_target)
+        if c and ps.has_surface_mesh("target"):
+            ps.get_surface_mesh("target").set_enabled(S.show_target)
         c, S.show_cells = psim.Checkbox("Active sub-cubes", S.show_cells)
         if c:
             draw_cells()
@@ -235,6 +425,15 @@ def ui():
         psim.TextUnformatted(f"max |f(V)-lvl|  {S.max_err:.1e}")
         psim.TextUnformatted(f"Mesh check      {'ok' if S.check.get('ok', True) else 'FAILED'}")
         psim.TextUnformatted(f"Extraction      {1000 * S.t_extract:.1f} ms")
+        err = S.entries[S.entry_idx].get("error")
+        if err and "rms" in err:
+            psim.Separator()
+            psim.TextUnformatted("Fit error (saved by optimize.py)")
+            psim.TextUnformatted(f"  RMS           {err['rms']:.3e}  ({100 * err['rms'] / err.get('cube_width', 2.0):.2f} % of cube)")
+            psim.TextUnformatted(f"  max fit->tgt  {err['fit_to_target_max']:.3e}")
+            psim.TextUnformatted(f"  max tgt->fit  {err['target_to_fit_max']:.3e}")
+            if "objective" in err:
+                psim.TextUnformatted(f"  objective     {err['objective']:.3e}")
         if psim.TreeNode("Pruning per level"):
             for lvl, tested, active in st.get("levels", []):
                 psim.TextUnformatted(f"level {lvl}: {active:6d} of {tested:6d} kept")
@@ -250,9 +449,10 @@ def main():
     ap.add_argument("--preset", choices=list(PRESETS), default="bowl")
     ap.add_argument("--depth", type=int, default=4)
     ap.add_argument("--level", type=float, default=0.0)
+    ap.add_argument("--load", help="values from a fit.json written by optimize.py")
     args = ap.parse_args()
 
-    S.preset_idx = S.preset_names.index(args.preset)
+    S.entry_idx = list(PRESETS).index(args.preset)
     S.values = list(args.values) if args.values else list(PRESETS[args.preset])
     S.depth, S.level = args.depth, args.level
 
@@ -262,6 +462,12 @@ def main():
     ps.set_ground_plane_mode("shadow_only")
 
     draw_cube_frame()
+    here = os.path.dirname(os.path.abspath(__file__))
+    for folder in dict.fromkeys([os.getcwd(), here]):   # fits where you run it and next to the code
+        scan_fits(folder)
+    if args.load:
+        S.fit_path = args.load
+        load_fit(args.load)
     rebuild()
     ps.reset_camera_to_home_view()
     ps.set_user_callback(ui)
