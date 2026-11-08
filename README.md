@@ -17,6 +17,11 @@ Polyscope, and optimizes the 8 values so the surface matches a target.
 | `warp_optimize.py` | fit the 16 values to a target |
 | `warp_viewer.py` | viewer with 16 sliders, the warped cube and fit loading |
 | `test_warp.py` | tests for the 16-value cube |
+| `classify_optimize.py` | fit either cube by inside/outside classification: logistic loss + Adam, evolution strategies, or GRPO (reward only) |
+| `test_classify.py` | tests for the classification optimizers |
+| `box.py` | `Box`: where a cube sits (`lo`, `size`), lattices, `--lo/--size` options, grid helpers (`grid_cell`, `corner_vertex_ids`) |
+| `test_box.py` | tests for cubes at any position and size, and the grid preparation |
+| `benchmark_warp.py` | compares every 16-value optimizer (time, own loss, common chamfer distance) |
 
 ## Setup
 
@@ -25,6 +30,7 @@ cd cubespline
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python test_cubespline.py && python test_optimize.py   # quick self-check
+python test_warp.py && python test_classify.py && python test_box.py
 ```
 
 ## Use
@@ -209,11 +215,63 @@ The natural next step for curved targets is several cubes sharing corner values,
 a grid of trilinear cells (the "cube spline"). The pieces here, the mesher, the
 differentiable vertices and the loss registry, carry over unchanged to that setting.
 
+## Cube position and size (`box.py`)
+
+Every cube is an axis-aligned cube `[lo, lo + size]³`, by default `[-1, 1]³`. All
+the optimizers and both viewers take `--lo X Y Z` and `--size S`:
+
+```bash
+python optimize.py --target "sphere cap" --lo 0 -1 0 --size 1        # a corner octant of the default cube
+python warp_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1
+python classify_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1
+python viewer.py --preset saddle --lo 2 0 0 --size 0.5
+```
+
+* **Targets live in world space** and are clipped to the cube. The built-in
+  functions were designed around `[-1, 1]³`, so a cube placed elsewhere sees a
+  different part of them, or nothing. Then you get the error "no surface inside
+  the cube".
+* **Values are dimensionless.** The same values give the same shape, moved and
+  scaled, in any cube. The 16-value offsets are measured in half-widths: corner n
+  moves by `c1[n] · size/2` along its diagonal. For the default cube this is the
+  world unit used before, so earlier fits and presets are unchanged.
+* **Saved fits** store `"lo"` and `"size"`. Files without them load as the
+  default cube. The viewers move the cube, the target and the camera to each
+  fit's box. Presets use `--lo/--size`. The current box is shown under the combo
+  box.
+* **Errors** (RMS, max) are in world units, and as a percentage of the cube width.
+
+Example: the corner octant `--lo 0 -1 0 --size 1` of the sphere cap. The 8-value
+fit reaches RMS 1.8e-3 and the 16-value fit 1.1e-3, both well under 1 % of the
+cube width. That octant contains only a flank-like part of the cap.
+
+### Preparing for grids of cubes
+
+Not implemented yet. The pieces in place:
+
+* `Box.grid_cell(origin, h, ijk)` is cell `ijk` of a regular grid.
+  `corner_vertex_ids(ijk, dims)` gives the ids of its 8 corners (same order
+  `n = i + 2j + 4k`) in the grid's `(nx+1)(ny+1)(nz+1)` vertex array. A grid
+  stores one value per grid vertex, and a cell uses `values[corner_vertex_ids(ijk, dims)]`.
+* The 8-value mesh topology stores each mesh vertex's lattice edge `(a_ijk, b_ijk)`
+  at resolution `2^depth`. In a grid, `ijk · 2^depth + a_ijk` gives a global key,
+  which joins the meshes of neighbouring cells on their common face.
+* **8 values:** neighbouring cells sharing their corner values meet without a
+  seam (`test_box.py` checks the field agrees exactly on the common face).
+* **16 values:** not yet. Corner offsets move along the cell's own diagonal,
+  `e_n = (2i−1, 2j−1, 2k−1)`, which points outward from that cell. A grid
+  vertex shared by two cells is therefore moved in different directions by
+  each, so the field jumps across the face, even with shared offsets and
+  values (by about 0.09 in a random test). Making 16-value grids continuous
+  needs a choice of offset rule first. For example, a 3-vector displacement
+  per grid vertex instead of a scalar along each cell's diagonal, with the
+  displacement kept tangential on the faces.
+
 ## Second version: the 16-value cube (`warpcube.py`)
 
 ```
 values = [ offset c1 (8) | field c2 (8) ]
-x'   = x + D(x),   D(x) = Σ_n w_n(x) c1[n] e_n      e_n = corner n's diagonal direction (±1, ±1, ±1)
+x'   = x + D(x),   D(x) = (size/2) Σ_n w_n(x) c1[n] e_n      e_n = corner n's diagonal direction (±1, ±1, ±1)
 f(x) = T2(x')      T2 = trilinear interpolation of c2 (extended outside the cube if x' leaves it)
 ```
 
@@ -299,3 +357,204 @@ Each run takes 40–60 s on a laptop CPU.
   matters; from zero offset alone, the refinement stays near the 8-value solution.
 * The two "(fitted)" presets in `warp_viewer.py` are the sphere-cap and torus-inner
   results from this table.
+
+## Third optimizer: inside/outside classification (`classify_optimize.py`)
+
+Instead of distances to the target surface, points are sampled in the cube and
+labelled by the analytic target g: `y = +1` outside (g > 0), `y = -1` inside. The
+cube is right at x when `sign(f(x)) == y`. The reward is
+
+    R = mean_x  y · sign(f(x))   =  2 · accuracy − 1
+
+R is a step function of the values. A small change almost never flips a sample,
+so its gradient is zero almost everywhere and Adam cannot use it directly. There
+are three ways around that, and all work with the 8-value cube (`--cube 8`,
+default) and the 16-value cube (`--cube 16`):
+
+| `--method` | what it optimizes | how |
+|---|---|---|
+| `logistic` (default) | a smooth version of the reward: `softplus(−y f / τ)` + weight decay | Adam on its gradient. This is logistic regression; for the 8-value cube the features are the 8 trilinear weights, so the loss is **convex**: one optimum, reached from zero values. |
+| `es` | the true ±1 reward | evolution strategies (REINFORCE / policy gradient on the values): sample `θ = μ + σε` in ± pairs, rank the rewards, step μ along `Σ u_i ε_i / (pop σ)` with Adam. No derivative of f is used. |
+| `grpo` | the true ±1 reward | Group Relative Policy Optimization (as in DeepSeek-R1 training): a Gaussian policy N(μ, diag σ²) over the values, with **μ and σ both learned**. Each iteration samples a group of G value vectors on the same batch of points, takes advantages `A_i = (R_i − mean R) / std R` (no critic), and runs `--grpo-epochs` Adam steps on the PPO clipped surrogate `min(r_i A_i, clip(r_i, 1±ε) A_i)`, optionally minus β·KL(π‖π_ref). |
+
+Samples (`--sampling`):
+
+* `random` (default): a fresh batch every step. Most points lie near the target
+  surface (surface points moved along the normal by N(0, band²)), and `--uniform`
+  (25 %) lie anywhere in the cube. Far from the surface everything is classified
+  correctly and carries no information. The iterate with the best reward on a
+  fixed set of random validation points is kept.
+* `lattice`: the same regular `k × k × k` lattice every step (`--k`, default 10,
+  i.e. 1000 points). By default the points are cell centres, `(i + ½)/k`, all
+  strictly inside the cube. With `--lattice-faces` they are `i/(k−1)`, which puts
+  points on the faces, edges and corners too. The reward is the accuracy on
+  exactly these points, and the iterate kept is the best on the lattice. The
+  report also gives the accuracy on independent random points, to show how well
+  the lattice fit generalises.
+
+16-value cube: the problem is not convex, so stage 1 runs `--starts` random
+starts plus the 8-value solution (zero offset) for `--start-iters` steps each.
+The best one continues for `--iters` steps.
+
+```bash
+python classify_optimize.py --target "sphere flank"                       # 8 values, logistic
+python classify_optimize.py --target "sphere flank" --method es
+python classify_optimize.py --cube 16 --target "sphere cap"               # 16 values
+python classify_optimize.py --cube 16 --target "sphere cap" --method es --iters 600
+python classify_optimize.py --cube 16 --target "torus inner" --method grpo
+python classify_optimize.py --cube 16 --target "sphere cap" --chamfer-iters 200   # then chamfer refinement
+python classify_optimize.py --cube 16 --target "sphere cap" --sampling lattice           # 10x10x10 = 1000 points
+python classify_optimize.py --cube 16 --target "sphere cap" --sampling lattice --k 20 --lattice-faces
+python warp_viewer.py --load classify_warp_fit.json                       # view (8-value: viewer.py --load classify_fit.json)
+```
+
+| option | default | meaning |
+|---|---|---|
+| `--iters` | 400 | steps (ES: generations); stage 2 for `--cube 16` |
+| `--sampling` | random | `random` (fresh batches) or `lattice` (fixed k³ points) |
+| `--k`, `--lattice-faces` | 10, off | lattice: points per axis; include the faces, edges and corners |
+| `--batch` | 4000 | random: labelled samples per step |
+| `--band`, `--uniform` | 0.1, 0.25 | random: near-surface jitter (for a cube of width 2, scales with the cube), fraction of uniform samples |
+| `--lo`, `--size` | -1 -1 -1, 2 | the cube |
+| `--tau`, `--weight-decay` | 0.02, 1e-3 | logistic: soft-boundary width, scale of the field |
+| `--pop`, `--sigma` | 32, 0.1 | ES: perturbations per generation, perturbation size (decays to 0.02) |
+| `--group`, `--grpo-epochs`, `--clip` | 32, 4, 0.2 | GRPO: group size G, Adam steps per group, ratio clipping ε |
+| `--grpo-sigma`, `--grpo-lr` | 0.2, 0.02 | GRPO: initial policy std (then learned), learning rate for μ and log σ |
+| `--kl-coef`, `--ref-every` | 0, 10 | GRPO: β of KL(π‖π_ref), and how often π_ref is refreshed |
+| `--starts`, `--start-iters` | 8, 100 | `--cube 16` only: stage 1 |
+| `--offset-penalty` | 0.01 | `--cube 16` only: λ · mean(offset²), against corner bubbles (see below) |
+| `--chamfer-iters` | 0 | refine afterwards with the chamfer optimizer of `optimize.py` / `warp_optimize.py` |
+
+The report gives the validation accuracy (overall, and within 0.05 of the
+surface), the same RMS distance as the other optimizers, and the number of
+pieces of the fitted surface.
+
+**Corner bubbles.** Accuracy measures volume, not distance. Without the offset
+penalty, ES on the 16-value cube reached 99.3 % accuracy on the sphere flank but
+RMS 0.14. A corner offset of 3.9 sends the points near that corner far outside the
+cube. The second trilinear field is extrapolated there and changes sign again,
+which creates two small closed bubbles. They hold 0.17 % of the volume, so they
+cost almost nothing in accuracy, and the chamfer refinement cannot remove a
+detached piece. The default penalty λ = 0.01 removes them (RMS 3.2e-3), and the
+"surface pieces" line in the report flags any that remain.
+
+**GRPO settings.** The KL term is off by default. In LLM training it keeps the
+model close to the pretrained one. Here the policy has to travel far from its
+start, and β = 0.04 (the DeepSeek value) roughly doubled the error on the caps.
+Without it, the reference policy plays no role. The learned σ shrinks by itself
+(0.2 → about 0.003 over a run), which replaces the fixed σ schedule of ES.
+Starting σ at 0.1 instead of 0.2 let it narrow too early on torus inner (RMS
+8e-2 vs 2e-2).
+
+### Results (default settings, about 1–2 s for 8 values, 5 s logistic / 11–14 s ES and GRPO for 16)
+
+RMS distance to the target (cube width 2); the last column is the chamfer
+optimizers (`optimize.py` / `warp_optimize.py`) from the tables above.
+
+| target | 8 logistic | 8 ES | 8 GRPO | 16 logistic | 16 ES | 16 GRPO | chamfer 8 / 16 |
+|---|---|---|---|---|---|---|---|
+| sphere flank | 8.9e-3 | 9.5e-3 | 9.5e-3 | 5.6e-3 | 3.2e-3 | 7.7e-3 | 8.4e-3 / 2.4e-3 |
+| large sphere flank | 3.7e-3 | 3.8e-3 | 3.7e-3 | 3.1e-3 | 3.5e-3 | 2.8e-3 | 3.5e-3 / 7.2e-4 |
+| torus outer flank | 8.8e-3 | 9.0e-3 | 9.3e-3 | 4.0e-3 | 7.0e-3 | 6.8e-3 | 8.5e-3 / 3.0e-3 |
+| torus inner flank | 7.0e-3 | 6.7e-3 | 7.4e-3 | 4.1e-3 | 6.9e-3 | 5.5e-3 | 6.7e-3 / 3.2e-3 |
+| sphere cap | 8.8e-2 | 1.0e-1 | 1.1e-1 | 1.6e-2 | 1.8e-2 | 2.4e-2 | 8.7e-2 / 5.8e-3 |
+| large sphere cap | 1.1e-2 | 1.0e-2 | 9.8e-3 | 6.7e-3 | 8.6e-3 | 8.4e-3 | 9.4e-3 / 3.0e-3 |
+| torus outer | 1.1e-1 | 1.2e-1 | 1.1e-1 | 3.8e-2 | 4.2e-2 | 4.5e-2 | 9.8e-2 / 1.2e-2 |
+| torus inner | 1.3e-1 | 1.5e-1 | 1.4e-1 | 6.0e-2 | 4.7e-2 | 2.0e-2 | 1.3e-1 / 1.2e-2 |
+
+* 8 values: both methods match the chamfer optimizer starting from zero values,
+  with no closed-form start and no mesh.
+* 16 values: classification gets most of the gain over 8 values, but stays 1.5–4×
+  behind the chamfer optimizer on caps and tori. It optimizes sign agreement over
+  a band of width ~0.1, not the exact position of the surface.
+  `--chamfer-iters` helps a little (sphere cap 1.6e-2 → 1.4e-2); the chamfer
+  optimizer's own multi-start finds a better basin.
+* ES and GRPO need no derivatives and do about as well as logistic, at 2–3× the
+  time for 16 values. No single method wins everywhere: GRPO is best of the
+  classifiers on torus inner, ES on the sphere flank, logistic on the caps.
+
+### Lattice sampling (`--sampling lattice`)
+
+RMS distance to the target, with random sampling for comparison (from the table
+above). The lattice is 10³ = 1000 or 20³ = 8000 cell-centre points.
+
+| target | cube | logistic k=10 / 20 | ES k=10 / 20 | GRPO k=10 / 20 | random (logistic / ES / GRPO) |
+|---|---|---|---|---|---|
+| sphere flank | 8 | 1.5e-2 / 1.1e-2 | 1.1e-2 / 9.7e-3 | 1.0e-2 / 1.1e-2 | 8.9e-3 / 9.5e-3 / 9.5e-3 |
+| sphere flank | 16 | 1.0e-2 / 6.8e-3 | 8.9e-3 / 8.5e-3 | 1.1e-2 / 8.1e-3 | 5.6e-3 / 3.2e-3 / 7.7e-3 |
+| sphere cap | 16 | 1.8e-2 / 3.1e-2 | 2.2e-2 / 1.5e-2 | 4.7e-2 / 2.1e-2 | 1.6e-2 / 1.8e-2 / 2.4e-2 |
+| torus inner | 16 | 5.3e-2 / 5.5e-2 | 7.5e-2 / 4.7e-2 | 8.6e-2 / 4.1e-2 | 6.0e-2 / 4.7e-2 / 2.0e-2 |
+
+* At k = 10 nearly every lattice point ends up on the right side: 100 % on the
+  sphere flank and cap with 16 values, 98–99 % on torus inner. The surface is
+  still free to move anywhere between neighbouring lattice points, about 0.2
+  apart. So on flanks the RMS is about 1.5× that of random near-surface
+  sampling, and the accuracy on random validation points is lower (95–98 %
+  instead of 98 %).
+* k = 20 usually closes much of that gap (ES and GRPO on the cap and torus
+  inner), but costs about 3× more time for ES and GRPO.
+* One 16-value GRPO run at k = 20 (sphere flank) had a small extra surface piece.
+  The report flags these.
+
+## Benchmark: all optimizers of the 16-value cube on the three sphere targets
+
+`python benchmark_warp.py` (about 12 min) runs every method with its default
+settings on `sphere`, `sphere cap` and `sphere flank`, with 3 seeds each.
+
+* **Own loss** is the objective each method minimises, at its result. It can only
+  be compared within a row:
+  * Sampson: f²/|∇f|² + normal term;
+  * chamfer: the chamfer loss;
+  * logistic: the softplus loss on the last batch;
+  * ES / GRPO: (1 − R)/2, the misclassification rate of the last population.
+* **CD** is the same measure for all methods: the two-sided chamfer distance
+  `mean d(p, target)² + mean d(q, fit)²`, in world units² (cube width 2), with
+  exact point-to-surface distances.
+  * p are 20 000 samples of the fitted mesh at depth 6; q are 20 000 target
+    samples that no method was trained on.
+  * Point-to-point distances between two sample sets would add a floor of about
+    0.008, larger than the differences measured here.
+* Values are medians over the 3 seeds; the worst seed is in parentheses.
+  `*` marks one seed whose surface had extra pieces.
+
+| method | kind | time (s) | sphere: own loss | sphere: CD ×1e-4 | cap: own loss | cap: CD ×1e-4 | flank: own loss | flank: CD ×1e-4 |
+|---|---|---|---|---|---|---|---|---|
+| Sampson multi-start (stage 1) | differentiable | 11 | 5.2e-3 | 440 (1400) ** | 2.0e-3 | **0.78** (0.94) | 5.5e-6 | **0.11** (0.12) |
+| chamfer (stage 1 + 300 Adam) | differentiable | 35 | 4.1e-2 | 440 (1400) *** | 8.8e-4 | **0.74** (0.80) | 9.8e-4 | **0.11** (0.12) |
+| logistic, random | differentiable | 4 | 3.6e-1 | 93 (790) ** | 1.1e-1 | 3.7 (5.0) | 5.6e-2 | 0.71 (0.72) |
+| logistic, lattice 10³ | differentiable | 2 | 9.6e-2 | 62 (62) | 2.1e-2 | 11 (15) | 1.1e-2 | 2.0 (2.0) |
+| ES, random | reward only | 11 | 1.2e-1 | **26** (27) ** | 5.6e-2 | 6.8 (7.8) | 2.5e-2 | 0.8 (120) * |
+| ES, lattice 10³ | reward only | 4 | 2.8e-2 | **23** (23) * | 1.1e-2 | 25 (230) | 4.7e-3 | 1.5 (1.6) |
+| GRPO, random | reward only | 15 | 8.8e-2 | 28 (700) * | 3.7e-2 | 12 (29) | 1.9e-2 | 1.3 (1.6) |
+| GRPO, lattice 10³ | reward only | 7 | 5.4e-2 | 210 (580) | 6.7e-3 | 43 (45) | 8.6e-4 | 2.3 (2.4) |
+
+(Times are medians over all runs; `sphere` runs take about 1.5× longer for the
+chamfer method.)
+
+**What it shows**
+
+* **Cap and flank (the surface fits in one cube).** The surface-based,
+  differentiable methods win clearly.
+  * The multi-start Sampson fit reaches CD 0.78e-4 / 0.11e-4 (RMS 6e-3 / 2e-3) in
+    11 s. The chamfer refinement adds 20–25 s for a small gain (cap 0.78 → 0.74,
+    flank unchanged).
+  * The classifiers are 5–100× worse in CD. Logistic is the best and fastest of
+    them (cap 3.7e-4 in 4 s).
+  * ES and GRPO, which only see the reward, are 2–3× slower, worse, and vary
+    more between seeds.
+  * Lattice sampling is the fastest but loses accuracy: 1000 fixed points
+    leave the surface free between them.
+* **Whole sphere (a closed surface, not representable by one cube).** Every
+  method is poor (RMS ≥ 0.03 on a sphere of radius 0.8), but the order is
+  reversed.
+  * The Sampson and chamfer fits fall into solutions with extra closed pieces
+    in 2–3 of 3 seeds (CD 4e-2 to 1.4e-1).
+  * ES is the most reliable (CD about 2.5e-3 for every seed, random or
+    lattice). A volume reward penalises wrong inside/outside everywhere in the
+    cube, while the surface losses only look near the target samples, and
+    bubbles away from them cost little.
+* **Own loss vs CD.** Within a method, a lower own loss does not mean a better
+  surface. Every lattice variant has a lower own loss than its random version,
+  because 1000 fixed points are easier to classify, yet it has a higher CD.
+  On the sphere, no chamfer step beat the multi-start result, so keep-best
+  returned it unchanged and the two rows have the same CD.

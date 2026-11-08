@@ -169,6 +169,8 @@ class Topology:
     lo: torch.Tensor
     size: float
     stats: dict = field(default_factory=dict)
+    a_ijk: np.ndarray | None = None   # (nv, 3) int64 lattice endpoints of each vertex's edge,
+    b_ijk: np.ndarray | None = None   # at resolution R (for welding cells of a grid, see box.py)
 
     @property
     def resolution(self) -> int:
@@ -353,7 +355,7 @@ def extract_topology(cube: Cube, depth: int = 3, level: float = 0.0) -> Topology
 
     stats.update({"vertices": len(a_ijk), "faces": len(F),
                   "cases": n_cases, "ambiguous_faces": n_amb})
-    return Topology(F, pa, pb, Wa, Wb, cells, depth, level, lo.clone(), cube.size, stats)
+    return Topology(F, pa, pb, Wa, Wb, cells, depth, level, lo.clone(), cube.size, stats, a_ijk, b_ijk)
 
 
 def marching_cubes(cube: Cube, depth: int = 3, level: float = 0.0):

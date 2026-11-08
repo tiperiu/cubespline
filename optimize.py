@@ -2,7 +2,8 @@
 """
 optimize.py -- fit the 8 corner values so the marching-cubes surface matches a target.
 
-    target (function g(x) or mesh), clipped to the cube
+    target (function g(x) or mesh), clipped to the cube [lo, lo + size]^3 (--lo, --size;
+    default [-1, 1]^3; targets live in world space, see box.py)
         -> samples: points + outward normals
     init:   closed-form algebraic fit (Taubin), linear in the 8 values
     refine: for each iteration
@@ -21,6 +22,7 @@ Usage:
     python optimize.py --target sphere --depth 5 --refine-iters 300
     python optimize.py --target "sphere flank" --no-refine     # closed-form start only
     python optimize.py --target trilinear --view          # watch it converge
+    python optimize.py --target "sphere cap" --lo 0 -1 0 --size 1   # a smaller cube elsewhere
     python optimize.py --mesh bunny.obj --loss chamfer=1 --loss algebraic=0.1
     python optimize.py --list
 The fitted values are written to fit.json; open them with  python viewer.py --load fit.json
@@ -36,6 +38,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from box import Box, add_box_arguments, box_from_args
 from cube import Cube, CUBE_EDGES
 from marching import extract_topology, mesh_from_grid, to_numpy
 
@@ -47,9 +50,10 @@ DT = torch.float64
 # ============================================================================
 @dataclass
 class Target:
-    """A target surface restricted to the cube.
+    """A target surface restricted to a cube (its `box`).
     V, F           target mesh (inside the cube) -- for display
     points, normals  (N, 3) torch samples on the target, area-uniform, unit normals
+    box            the cube the target is clipped to; fits of this target use it
     """
     name: str
     V: np.ndarray
@@ -58,6 +62,11 @@ class Target:
     normals: torch.Tensor
     values: np.ndarray | None = None   # ground-truth 8 values, if the target is trilinear
     fn: object = None                  # g(x) for function targets (None for meshes)
+    box: Box = field(default_factory=Box)
+
+    def cube(self, values=None, requires_grad=False) -> Cube:
+        """An 8-value cube placed in this target's box."""
+        return Cube(values, requires_grad=requires_grad, **self.box.kw)
 
 
 def sample_surface(V, F, n, rng):
@@ -76,8 +85,10 @@ def sample_surface(V, F, n, rng):
     return P, N
 
 
-def _inside_box(P, lo, size, eps=1e-9):
-    return np.all((P >= lo - eps) & (P <= lo + size + eps), axis=1)
+def _as_box(box, lo, size) -> Box:
+    if box is not None:
+        return box
+    return Box() if lo is None else Box(lo, 2.0 if size is None else size)
 
 
 def _fn_gradient(fn, P, h=1e-6):
@@ -94,40 +105,44 @@ def project_to_zero_set(fn, P, steps=4):
     return P
 
 
-def target_from_function(fn, name="function", lo=-1.0, size=2.0, res=64, n=4000, seed=0):
-    """fn: numpy (..., 3) -> (...), negative inside. Its zero set inside the cube is
+def target_from_function(fn, name="function", box: Box | None = None, res=64, n=4000, seed=0,
+                         lo=None, size=None):
+    """fn: numpy (..., 3) -> (...), negative inside, in world coordinates.
+    Its zero set inside the cube `box` (default [-1, 1]^3; or give lo, size) is
     meshed with the same marching cubes (mesh_from_grid), sampled area-uniformly,
     and the samples are projected onto the true zero set (Newton); normals are
     the normalised gradient of fn (pointing towards fn > 0)."""
-    t = np.linspace(lo, lo + size, res + 1)
-    X = np.stack(np.meshgrid(t, t, t, indexing="ij"), -1)
-    V, F = mesh_from_grid(fn(X), lo, size)
+    box = _as_box(box, lo, size)
+    t = np.linspace(0.0, 1.0, res + 1)
+    X = box.to_world(np.stack(np.meshgrid(t, t, t, indexing="ij"), -1))
+    V, F = mesh_from_grid(fn(X), box.lo_np, box.size)
     if not len(F):
-        raise ValueError(f"target '{name}' has no surface inside the cube")
+        raise ValueError(f"target '{name}' has no surface inside the cube {box}")
     rng = np.random.default_rng(seed)
     P, _ = sample_surface(V, F, int(1.2 * n), rng)
     P = project_to_zero_set(fn, P)
-    P = P[_inside_box(P, lo, size)][:n]
+    P = P[box.contains(P)][:n]
     N = _fn_gradient(fn, P)
     N /= np.linalg.norm(N, axis=1, keepdims=True)
-    return Target(name, V, F, torch.as_tensor(P, dtype=DT), torch.as_tensor(N, dtype=DT), fn=fn)
+    return Target(name, V, F, torch.as_tensor(P, dtype=DT), torch.as_tensor(N, dtype=DT), fn=fn, box=box)
 
 
-def target_from_mesh(V, F, name="mesh", lo=-1.0, size=2.0, n=4000, seed=0):
-    """Sample a triangle mesh and keep only the samples inside the cube (clipping).
+def target_from_mesh(V, F, name="mesh", box: Box | None = None, n=4000, seed=0, lo=None, size=None):
+    """Sample a triangle mesh and keep only the samples inside the cube `box` (clipping).
     For display, keep the triangles whose centroid is inside the cube."""
+    box = _as_box(box, lo, size)
     V, F = np.asarray(V, float), np.asarray(F, np.int64)
     rng = np.random.default_rng(seed)
     P, N = sample_surface(V, F, 8 * n, rng)
-    m = _inside_box(P, lo, size)
+    m = box.contains(P)
     if m.sum() < 50:
-        raise ValueError(f"mesh '{name}' has almost no area inside the cube [{lo}, {lo + size}]^3")
+        raise ValueError(f"mesh '{name}' has almost no area inside the cube {box}")
     P, N = P[m], N[m]
     if len(P) > n:
         sel = rng.choice(len(P), n, replace=False)
         P, N = P[sel], N[sel]
-    Fd = F[_inside_box(V[F].mean(1), lo, size)]
-    return Target(name, V, Fd, torch.as_tensor(P, dtype=DT), torch.as_tensor(N, dtype=DT))
+    Fd = F[box.contains(V[F].mean(1))]
+    return Target(name, V, Fd, torch.as_tensor(P, dtype=DT), torch.as_tensor(N, dtype=DT), box=box)
 
 
 def load_obj(path):
@@ -147,9 +162,10 @@ def load_obj(path):
     return np.array(V, float), np.array(F, np.int64)
 
 
-def _trilinear_target(seed=7):
+def _trilinear_target(seed=7, box: Box | None = None):
+    """A random trilinear field in `box`: the 8-value cube can fit it exactly."""
     vals = np.random.default_rng(seed).normal(size=8)
-    cube = Cube(vals, requires_grad=False)
+    cube = Cube(vals, requires_grad=False, **(box or Box()).kw)
 
     def fn(X):
         with torch.no_grad():
@@ -238,13 +254,15 @@ SLICES = {
 FUNCTIONS.update(SLICES)
 
 
-def builtin_target(name, n=4000, seed=0):
+def builtin_target(name, n=4000, seed=0, box: Box | None = None):
+    """A named target clipped to `box` (default [-1, 1]^3). The functions are fixed
+    in world space (designed for the default cube); "trilinear" is generated in the box."""
     if name == "trilinear":
-        fn, vals = _trilinear_target()
-        t = target_from_function(fn, name, n=n, seed=seed)
+        fn, vals = _trilinear_target(box=box)
+        t = target_from_function(fn, name, box=box, n=n, seed=seed)
         t.values = vals
         return t
-    return target_from_function(FUNCTIONS[name], name, n=n, seed=seed)
+    return target_from_function(FUNCTIONS[name], name, box=box, n=n, seed=seed)
 
 
 # ============================================================================
@@ -290,9 +308,12 @@ def fit_with_normals(cube: Cube, points: torch.Tensor, normals: torch.Tensor, mu
         return c / c.norm() * np.sqrt(8)
 
 
-def fit_algebraic(cube: Cube, target: "Target", mus=(1e-3, 1e-2, 1e-1, 1.0), depth=4, verbose=False):
+def fit_algebraic(cube: Cube | None, target: "Target", mus=(1e-3, 1e-2, 1e-1, 1.0), depth=4, verbose=False):
     """Closed-form initialisation: try Taubin and the normal-constrained fits for
-    several mu, keep the candidate with the smallest true surface distance."""
+    several mu, keep the candidate with the smallest true surface distance.
+    cube=None uses a cube in the target's box."""
+    if cube is None:
+        cube = target.cube()
     cands = {"taubin": fit_taubin(cube, target.points, target.normals)}
     for mu in mus:
         cands[f"normals mu={mu:g}"] = fit_with_normals(cube, target.points, target.normals, mu)
@@ -401,7 +422,7 @@ class Fitter:
         self.target, self.cfg = target, config
         self.verbose = verbose
         self.init_choice = "given"
-        self.cube = Cube(requires_grad=True)
+        self.cube = target.cube(requires_grad=True)
         self.gen = torch.Generator().manual_seed(config.seed)
         self.reset(values)
 
@@ -427,7 +448,7 @@ class Fitter:
     def objective(self, values=None):
         """The configured loss terms at `values` (default: current), with a fixed
         set of mesh samples so the number is reproducible. Returns (total, {term: value})."""
-        cube = self.cube if values is None else Cube(values, requires_grad=False)
+        cube = self.cube if values is None else self.target.cube(values)
         with torch.no_grad():
             topo = extract_topology(cube, self.cfg.depth)
             if not len(topo.F):
@@ -460,7 +481,7 @@ class Fitter:
             # undoes it). Restart from the closed-form fit, plus a small random
             # perturbation if even that is empty.
             v, _ = fit_algebraic(cube, self.target)
-            if not len(extract_topology(Cube(v, requires_grad=False), cfg.depth).F):
+            if not len(extract_topology(self.target.cube(v), cfg.depth).F):
                 v = v + 0.3 * torch.randn(8, dtype=DT, generator=self.gen)
             cube.set_values(v / v.norm() * np.sqrt(8))
             self.opt = torch.optim.Adam([cube.values], lr=self.opt.param_groups[0]["lr"])
@@ -530,7 +551,7 @@ def evaluate(values, target: Target, depth=6, n=20000, seed=1):
                     at area-uniform samples of the fitted mesh; for mesh targets the
                     nearest of 50k dense target samples.
     """
-    cube = Cube(values, requires_grad=False)
+    cube = target.cube(values)
     topo = extract_topology(cube, depth)
     if not len(topo.F):
         return {"empty": True}
@@ -582,7 +603,7 @@ def view(fitter: Fitter):
     ps.set_program_name("cubespline -- optimize")
     ps.set_up_dir("y_up")
     ps.set_ground_plane_mode("shadow_only")
-    P = to_numpy(Cube().corner_positions())
+    P = fitter.target.box.corners()
     ps.register_curve_network("cube", P, CUBE_EDGES, color=CUBE_COLOR).set_radius(0.004, relative=True)
     t = fitter.target
     tm = ps.register_surface_mesh("target", t.V, t.F, color=TARGET_COLOR, transparency=0.45)
@@ -725,7 +746,7 @@ def save_fit(path, fitter: Fitter, metrics=None):
     err = final_error(fitter, metrics)
     data = {"values": fitter.values.tolist(), "depth": fitter.cfg.depth, "target": fitter.target.name,
             "iterations": fitter.it, "losses": fitter.cfg.losses,
-            "final_loss": err["objective"], "final_error": err}
+            "final_loss": err["objective"], "final_error": err, **fitter.target.box.to_dict()}
     if metrics:
         data["metrics"] = metrics
     with open(path, "w") as fh:
@@ -759,6 +780,7 @@ def main():
     ap.add_argument("--loss", action="append", metavar="NAME=W", help=f"loss term, repeatable ({', '.join(LOSSES)})")
     ap.add_argument("--init", default="algebraic", choices=["algebraic", "random"])
     ap.add_argument("--seed", type=int, default=0)
+    add_box_arguments(ap)
     ap.add_argument("--out", default="fit.json")
     ap.add_argument("--view", action="store_true", help="open the live Polyscope view instead of running headless")
     ap.add_argument("--list", action="store_true", help="list targets and losses")
@@ -775,15 +797,15 @@ def main():
         else:
             import igl
             V, F = igl.read_triangle_mesh(args.mesh)
-        target = target_from_mesh(V, F, name=args.mesh, n=args.samples, seed=args.seed)
+        target = target_from_mesh(V, F, name=args.mesh, box=box_from_args(args), n=args.samples, seed=args.seed)
     else:
-        target = builtin_target(args.target, n=args.samples, seed=args.seed)
+        target = builtin_target(args.target, n=args.samples, seed=args.seed, box=box_from_args(args))
 
     cfg = FitConfig(depth=args.depth, iters=0 if args.no_refine else args.refine_iters, lr=args.lr,
                     mesh_samples=args.samples,
                     losses=_parse_losses(args.loss), init=args.init, seed=args.seed)
     fitter = Fitter(target, cfg, verbose=True)
-    print(f"target {target.name}: {len(target.points)} samples; losses {cfg.losses}; depth {cfg.depth}")
+    print(f"target {target.name}: {len(target.points)} samples; losses {cfg.losses}; depth {cfg.depth}; cube {target.box}")
     print("init values", np.round(fitter.values, 4).tolist())
     print("init metrics", evaluate(fitter.values, target))
 

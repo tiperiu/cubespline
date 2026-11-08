@@ -6,12 +6,15 @@ warpcube.py -- a cube with 16 values: an 8-value offset field and an 8-value sca
 Evaluation at a point x of the cube:
 
   1. Offset. Corner n is moved along its cube diagonal e_n = (2i-1, 2j-1, 2k-1)
-     by c1[n] (outward if positive; c1[n] world units in each of x, y, z).
+     by c1[n] half-widths (outward if positive): by h * c1[n] in each of x, y, z,
+     with h = size / 2. For the default cube [-1, 1]^3, h = 1 and c1 is in world units.
      Trilinear interpolation of the moved corners gives a new point
 
-         x' = sum_n w_n(x) (p_n + c1[n] e_n) = x + D(x),     D(x) = sum_n w_n(x) c1[n] e_n
+         x' = sum_n w_n(x) (p_n + h c1[n] e_n) = x + D(x),   D(x) = h sum_n w_n(x) c1[n] e_n
 
-     (w_n are the trilinear weights of x, p_n the original corners).
+     (w_n are the trilinear weights of x, p_n the original corners). Because the
+     offsets are relative to the cube, the same 16 values give the same shape,
+     moved and scaled, in a cube of any position and size (see box.py).
   2. Field. f(x) = T2(x'), the trilinear interpolation of c2, evaluated at x'.
      If x' leaves the cube the same trilinear polynomial is used (extrapolation).
 
@@ -60,17 +63,19 @@ def basis_grad_local(u: torch.Tensor) -> torch.Tensor:
     return torch.stack([outer(dw, wy, wz), outer(wx, dw, wz), outer(wx, wy, dw)], dim=-2)
 
 
-def offset_local(u: torch.Tensor, c1: torch.Tensor, size: float) -> torch.Tensor:
-    """The offset D, in local units, at local points u (..., 3) -> (..., 3)."""
+def offset_local(u: torch.Tensor, c1: torch.Tensor, size: float = 2.0) -> torch.Tensor:
+    """The offset D, in local units, at local points u (..., 3) -> (..., 3).
+    Offsets are in half-widths, so in local units (width 1) corner n moves by
+    c1[n] / 2 along e_n whatever the cube's size (`size` is kept for the API)."""
     E = torch.as_tensor(CORNER_DIR, dtype=u.dtype, device=u.device)
-    return (basis_local(u) * c1) @ E / size
+    return (basis_local(u) * c1) @ E / 2
 
 
-def offset_jacobian_local(u: torch.Tensor, c1: torch.Tensor, size: float) -> torch.Tensor:
+def offset_jacobian_local(u: torch.Tensor, c1: torch.Tensor, size: float = 2.0) -> torch.Tensor:
     """dD_k / du_j (local units) -> (..., 3[k], 3[j])."""
     E = torch.as_tensor(CORNER_DIR, dtype=u.dtype, device=u.device)
     G = basis_grad_local(u) * c1                       # (..., 3[j], 8)
-    return torch.einsum("...jn,nk->...kj", G, E) / size
+    return torch.einsum("...jn,nk->...kj", G, E) / 2
 
 
 # ----------------------------------------------------------------------------
@@ -143,9 +148,9 @@ class WarpCube(nn.Module):
         return self.lo + ijk * self.size
 
     def moved_corners(self) -> torch.Tensor:
-        """Corners after the offset: p_n + c1[n] e_n."""
+        """Corners after the offset: p_n + (size/2) c1[n] e_n."""
         E = torch.as_tensor(CORNER_DIR, dtype=self.dtype, device=self.lo.device)
-        return self.corner_positions() + self.offset[:, None] * E
+        return self.corner_positions() + self.offset[:, None] * E * (self.size / 2)
 
     def _x(self, x):
         return torch.as_tensor(x, dtype=self.dtype, device=self.lo.device)
@@ -178,10 +183,10 @@ def _basis_np(u):
     return (wz[..., :, None, None] * wy[..., None, :, None] * wx[..., None, None, :]).reshape(*u.shape[:-1], 8)
 
 
-def warp_local_np(values, u, size):
-    """Local u (..., 3) -> local u' = u + D(u)/size."""
+def warp_local_np(values, u, size=2.0):
+    """Local u (..., 3) -> local u' = u + D(u) (offsets in half-widths, see offset_local)."""
     c1 = np.asarray(values, np.float64)[:8]
-    return u + (_basis_np(u) * c1) @ CORNER_DIR / size
+    return u + (_basis_np(u) * c1) @ CORNER_DIR / 2
 
 
 def trilinear_np(c, u):

@@ -12,6 +12,7 @@ Usage:
     python viewer.py --preset saddle --depth 6
     python viewer.py --values -1 1 1 1 1 1 1 -1 --depth 5 --level 0.2
     python viewer.py --load fit.json                  # result of optimize.py
+    python viewer.py --preset saddle --lo 2 0 0 --size 0.5   # the cube elsewhere, smaller
 """
 
 import argparse
@@ -26,6 +27,7 @@ import numpy as np
 import polyscope as ps
 import polyscope.imgui as psim
 
+from box import Box, add_box_arguments, box_from_args
 from cube import Cube, CUBE_EDGES, CORNER_IJK, PRESETS
 from marching import extract_topology, mesh_check, save_obj, to_numpy
 
@@ -56,8 +58,10 @@ class State:
     slider_range = 2.0
     # combo-box entries: the presets, then every fit loaded from a fit.json
     # entry = {"name", "values", "depth" (or None), "target" (or None), "path" (or None)}
-    entries = [{"name": k, "values": list(v), "depth": None, "target": None, "path": None}
+    entries = [{"name": k, "values": list(v), "depth": None, "target": None, "path": None, "box": None}
                for k, v in PRESETS.items()]
+    box = Box()             # where the cube is now (fits carry their own; presets use preset_box)
+    preset_box = Box()      # --lo / --size
     entry_idx = list(PRESETS).index("bowl")
     fit_path = "fit.json"
     show_target = True
@@ -82,7 +86,7 @@ S = State()
 # --------------------------------------------------------------------------
 def rebuild():
     """Re-extract the surface for the current values / depth / level."""
-    S.cube = Cube(S.values, lo=-1.0, size=2.0, requires_grad=False)
+    S.cube = Cube(S.values, requires_grad=False, **S.box.kw)
     t = time.time()
     S.topo = extract_topology(S.cube, S.depth, S.level)
     S.V = to_numpy(S.topo.vertices(S.cube.values))
@@ -112,7 +116,19 @@ def select_entry(idx):
     if e["depth"] is not None:
         S.depth = int(e["depth"])
     S.slider_range = max(S.slider_range, float(np.abs(S.values).max()) * 1.2)
+    _apply_box(e.get("box") or S.preset_box)
     draw_target(e["target"])
+
+
+def _apply_box(box):
+    """Place the cube (and the target drawn with it) in `box`; reset the camera if it moved."""
+    if box == S.box:
+        return
+    S.box = box
+    S.target_name = None                        # the target is clipped to the box: rebuild it
+    if ps.is_initialized():
+        draw_cube_frame()
+        ps.reset_camera_to_home_view()
 
 
 def clean_path(text):
@@ -184,7 +200,8 @@ def load_fit(path):
     target = fit.get("target")
     name = f"fit: {os.path.basename(path)}" + (f" ({os.path.basename(str(target))})" if target else "")
     entry = {"name": name, "values": values, "depth": fit.get("depth"), "target": target,
-             "path": os.path.abspath(path), "error": fit.get("final_error") or fit.get("metrics")}
+             "path": os.path.abspath(path), "error": fit.get("final_error") or fit.get("metrics"),
+             "box": Box.from_dict(fit)}
     # reloading the same file replaces its entry instead of adding a duplicate
     for i, e in enumerate(S.entries):
         if e["path"] == entry["path"]:
@@ -216,7 +233,7 @@ def scan_fits(folder="."):
         S.entries.append({"name": f"fit: {os.path.basename(path)}" + (f" ({os.path.basename(str(target))})" if target else ""),
                           "values": [float(v) for v in fit["values"]], "depth": fit.get("depth"),
                           "target": target, "path": os.path.abspath(path),
-                          "error": fit.get("final_error") or fit.get("metrics")})
+                          "error": fit.get("final_error") or fit.get("metrics"), "box": Box.from_dict(fit)})
 
 
 def draw_target(target):
@@ -233,10 +250,10 @@ def draw_target(target):
     try:
         import optimize as O
         if target in O.FUNCTIONS or target == "trilinear":
-            t = O.builtin_target(target, n=500)
+            t = O.builtin_target(target, n=500, box=S.box)
         elif os.path.isfile(target):
             V, F = O.load_obj(target) if target.lower().endswith(".obj") else __import__("igl").read_triangle_mesh(target)
-            t = O.target_from_mesh(V, F, name=target, n=500)
+            t = O.target_from_mesh(V, F, name=target, n=500, box=S.box)
         else:
             print(f"  target '{target}' not found; showing the fit only")
             return
@@ -249,7 +266,7 @@ def draw_target(target):
 
 
 def draw_cube_frame():
-    P = to_numpy(Cube().corner_positions())
+    P = S.box.corners()
     cn = ps.register_curve_network("cube", P, CUBE_EDGES, color=CUBE_COLOR)
     cn.set_radius(0.004, relative=True)
 
@@ -323,6 +340,7 @@ def ui():
         if changed:
             select_entry(idx)
             dirty = True
+        psim.TextUnformatted(f"cube {S.box}")
         _, S.fit_path = psim.InputText("fit file", S.fit_path)
         if psim.Button("Browse..."):
             start = os.path.dirname(clean_path(S.fit_path)) or "."
@@ -450,7 +468,9 @@ def main():
     ap.add_argument("--depth", type=int, default=4)
     ap.add_argument("--level", type=float, default=0.0)
     ap.add_argument("--load", help="values from a fit.json written by optimize.py")
+    add_box_arguments(ap)
     args = ap.parse_args()
+    S.box = S.preset_box = box_from_args(args)
 
     S.entry_idx = list(PRESETS).index(args.preset)
     S.values = list(args.values) if args.values else list(PRESETS[args.preset])

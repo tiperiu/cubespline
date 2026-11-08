@@ -28,6 +28,7 @@ Usage:
     python warp_optimize.py --target "sphere cap" --start-iters 200 --refine-iters 500
     python warp_optimize.py --target "sphere cap" --no-refine
     python warp_optimize.py --target "sphere cap" --init regular   # start at the 8-value fit only
+    python warp_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1   # a smaller cube elsewhere
     python warp_optimize.py --target "torus inner flank" --depth 5 --refine-iters 400 --out warp_torus.json
     python warp_optimize.py --target "sphere cap" --view          # live window
     python warp_optimize.py --list
@@ -56,9 +57,14 @@ DT = torch.float64
 # ============================================================================
 # Distances to the target (same definitions as optimize.evaluate)
 # ============================================================================
+def warp_cube(target: O.Target, values=None, requires_grad=False) -> WarpCube:
+    """A 16-value cube placed in the target's box."""
+    return WarpCube(values, requires_grad=requires_grad, **target.box.kw)
+
+
 def evaluate(values, target: O.Target, depth=5, n=20000, seed=1):
     """First-order distances between the fitted surface and the target, both ways."""
-    cube = WarpCube(values, requires_grad=False)
+    cube = warp_cube(target, values)
     topo = WM.extract_topology(cube, depth)
     if not len(topo.F):
         return {"empty": True}
@@ -130,7 +136,7 @@ def fit_sampson(target: O.Target, v0, iters=100, normal_weight=1e-3, n_points=15
     """L-BFGS on the Sampson distance f^2/|grad f|^2 of the target points to the
     level set (plus a small normal-agreement term that picks the inside side).
     No mesh is involved, so it is fast and smooth."""
-    cube = WarpCube(v0, requires_grad=True)
+    cube = warp_cube(target, v0, requires_grad=True)
     P, N = target.points[:n_points], target.normals[:n_points]
     opt = torch.optim.LBFGS([cube.values], lr=0.5, max_iter=iters, line_search_fn="strong_wolfe")
 
@@ -156,7 +162,7 @@ def fit_sampson(target: O.Target, v0, iters=100, normal_weight=1e-3, n_points=15
 def multistart(target: O.Target, starts=16, seed=0, depth=5, verbose=False, start_iters=100):
     """Best of: the 8-value solution and `starts` random starts, each improved by
     fit_sampson. Scored by the true RMS distance. Returns (values, description)."""
-    field8, choice = O.fit_algebraic(Cube(), target)
+    field8, choice = O.fit_algebraic(None, target)
     base = torch.cat([torch.zeros(8, dtype=DT), field8])
     rng = torch.Generator().manual_seed(seed)
     cands = [("8-value fit", base)]
@@ -206,12 +212,12 @@ def _normalised(v):
 class WarpFitter:
     def __init__(self, target: O.Target, config: FitConfig, values=None, verbose=False):
         self.target, self.cfg, self.verbose = target, config, verbose
-        self.cube = WarpCube(requires_grad=True)
+        self.cube = warp_cube(target, requires_grad=True)
         self.gen = torch.Generator().manual_seed(config.seed)
         self.reset(values)
 
     def initial_values(self):
-        field8, choice = O.fit_algebraic(Cube(), self.target)
+        field8, choice = O.fit_algebraic(None, self.target)
         return torch.cat([torch.zeros(8, dtype=DT), field8]), f"8-value fit ({choice}), zero offset"
 
     def reset(self, values=None):
@@ -250,7 +256,7 @@ class WarpFitter:
 
     def objective(self, values=None):
         """Configured losses at `values`, fixed samples -> (total, {term: value})."""
-        cube = self.cube if values is None else WarpCube(values, requires_grad=False)
+        cube = self.cube if values is None else warp_cube(self.target, values)
         with torch.no_grad():
             topo = WM.extract_topology(cube, self.cfg.depth)
             if not len(topo.F):
@@ -346,7 +352,8 @@ def save_fit(path, fitter: WarpFitter, metrics=None):
     v = fitter.values
     data = {"type": "warp16", "values": v.tolist(), "offset": v[:8].tolist(), "field": v[8:].tolist(),
             "depth": fitter.cfg.depth, "target": fitter.target.name, "iterations": fitter.it,
-            "losses": fitter.cfg.losses, "final_loss": err["objective"], "final_error": err}
+            "losses": fitter.cfg.losses, "final_loss": err["objective"], "final_error": err,
+            **fitter.target.box.to_dict()}
     if metrics:
         data["metrics"] = metrics
     with open(path, "w") as fh:
@@ -366,7 +373,7 @@ def view(fitter: WarpFitter):
     ps.set_program_name("cubespline -- warp optimize")
     ps.set_up_dir("y_up")
     ps.set_ground_plane_mode("shadow_only")
-    P = to_numpy(Cube().corner_positions())
+    P = fitter.target.box.corners()
     ps.register_curve_network("cube", P, CUBE_EDGES, color=CUBE_COLOR).set_radius(0.004, relative=True)
     t = fitter.target
     tm = ps.register_surface_mesh("target", t.V, t.F, color=TARGET_COLOR, transparency=0.45)
@@ -458,6 +465,7 @@ def main():
                          "regular: 8-value fit with zero offset")
     ap.add_argument("--starts", type=int, default=16, help="random starts for --init multistart")
     ap.add_argument("--seed", type=int, default=0)
+    O.add_box_arguments(ap)
     ap.add_argument("--out", default="warp_fit.json")
     ap.add_argument("--view", action="store_true")
     ap.add_argument("--list", action="store_true")
@@ -468,9 +476,9 @@ def main():
         return
     if args.mesh:
         V, F = O.load_obj(args.mesh)
-        target = O.target_from_mesh(V, F, name=args.mesh, n=args.samples, seed=args.seed)
+        target = O.target_from_mesh(V, F, name=args.mesh, box=O.box_from_args(args), n=args.samples, seed=args.seed)
     else:
-        target = O.builtin_target(args.target, n=args.samples, seed=args.seed)
+        target = O.builtin_target(args.target, n=args.samples, seed=args.seed, box=O.box_from_args(args))
     losses = {"chamfer": 1.0}
     if args.loss:
         losses = {}
@@ -484,7 +492,7 @@ def main():
                     mesh_samples=args.samples, losses=losses, init=args.init, starts=args.starts,
                     start_iters=args.start_iters, seed=args.seed)
     fitter = WarpFitter(target, cfg, verbose=True)
-    print(f"target {target.name}: {len(target.points)} samples; losses {cfg.losses}; depth {cfg.depth}")
+    print(f"target {target.name}: {len(target.points)} samples; losses {cfg.losses}; depth {cfg.depth}; cube {target.box}")
     print(f"stage 1 ({cfg.init}, {cfg.starts} random starts x {cfg.start_iters} L-BFGS iterations): "
           f"{fitter.init_choice}, RMS {fitter.best_score:.4e}")
     print(f"stage 2: {cfg.iters} refinement steps" + ("  (skipped)" if cfg.iters == 0 else ""))

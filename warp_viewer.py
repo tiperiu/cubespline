@@ -14,6 +14,7 @@ Usage:
     python warp_viewer.py
     python warp_viewer.py --preset "twisted plane" --depth 6
     python warp_viewer.py --load warp_fit.json
+    python warp_viewer.py --preset "twisted plane" --lo 2 0 0 --size 0.5   # elsewhere, smaller
 """
 
 import argparse
@@ -27,6 +28,7 @@ import polyscope as ps
 import polyscope.imgui as psim
 import torch
 
+from box import Box, add_box_arguments, box_from_args
 from cube import CUBE_EDGES, CORNER_IJK
 from marching import mesh_check, save_obj, to_numpy
 from viewer import (BASE_COLOR, BACK_COLOR, EDGE_COLOR, CUBE_COLOR, CELL_COLOR, TARGET_COLOR,
@@ -39,8 +41,10 @@ MAX_CELLS_DRAWN = 40000
 
 
 class State:
-    entries = [{"name": k, "values": list(v), "depth": None, "target": None, "path": None, "error": None}
-               for k, v in WARP_PRESETS.items()]
+    entries = [{"name": k, "values": list(v), "depth": None, "target": None, "path": None, "error": None,
+                "box": None} for k, v in WARP_PRESETS.items()]
+    box = Box()             # where the cube is now (fits carry their own; presets use preset_box)
+    preset_box = Box()      # --lo / --size
     entry_idx = 0
     values = list(entries[0]["values"])
     depth = 5
@@ -84,7 +88,8 @@ def _entry_from_fit(path, fit):
     tag = "fit16" if fit.get("type") == "warp16" else "fit8"
     return {"name": f"{tag}: {os.path.basename(path)}" + (f" ({os.path.basename(str(target))})" if target else ""),
             "values": values, "depth": fit.get("depth"), "target": target,
-            "path": os.path.abspath(path), "error": fit.get("final_error") or fit.get("metrics")}
+            "path": os.path.abspath(path), "error": fit.get("final_error") or fit.get("metrics"),
+            "box": Box.from_dict(fit)}
 
 
 def _read_fit(path):
@@ -135,7 +140,19 @@ def select_entry(idx):
         S.depth = int(e["depth"])
     S.offset_range = max(S.offset_range, float(np.abs(S.values[:8]).max()) * 1.2)
     S.field_range = max(S.field_range, float(np.abs(S.values[8:]).max()) * 1.2)
+    _apply_box(e.get("box") or S.preset_box)
     draw_target(e["target"])
+
+
+def _apply_box(box):
+    """Place the cube (and the target drawn with it) in `box`; reset the camera if it moved."""
+    if box == S.box:
+        return
+    S.box = box
+    S.target_name = None                        # the target is clipped to the box: rebuild it
+    if ps.is_initialized():
+        draw_cube_frame()
+        ps.reset_camera_to_home_view()
 
 
 def draw_target(target):
@@ -151,10 +168,10 @@ def draw_target(target):
     try:
         import optimize as O
         if target in O.FUNCTIONS or target == "trilinear":
-            t = O.builtin_target(target, n=500)
+            t = O.builtin_target(target, n=500, box=S.box)
         elif os.path.isfile(target):
             V, F = O.load_obj(target)
-            t = O.target_from_mesh(V, F, name=target, n=500)
+            t = O.target_from_mesh(V, F, name=target, n=500, box=S.box)
         else:
             return
     except Exception as e:  # noqa: BLE001
@@ -169,7 +186,7 @@ def draw_target(target):
 # Geometry
 # --------------------------------------------------------------------------
 def rebuild():
-    S.cube = WarpCube(S.values, requires_grad=False)
+    S.cube = WarpCube(S.values, requires_grad=False, **S.box.kw)
     t = time.time()
     S.topo = WM.extract_topology(S.cube, S.depth, S.level)
     S.V = to_numpy(S.topo.vertices(S.cube.values))
@@ -187,7 +204,7 @@ def rebuild():
 
 
 def draw_cube_frame():
-    P = to_numpy(WarpCube().corner_positions())
+    P = S.box.corners()
     ps.register_curve_network("cube", P, CUBE_EDGES, color=CUBE_COLOR).set_radius(0.004, relative=True)
 
 
@@ -273,6 +290,7 @@ def ui():
         if changed:
             select_entry(idx)
             dirty = True
+        psim.TextUnformatted(f"cube {S.box}")
         _, S.fit_path = psim.InputText("fit file", S.fit_path)
         if psim.Button("Browse..."):
             p = choose_file(".")
@@ -368,8 +386,15 @@ def ui():
             psim.Separator()
             psim.TextUnformatted("Fit error (saved by the optimizer)")
             psim.TextUnformatted(f"  RMS           {err['rms']:.3e}  ({100 * err['rms'] / err.get('cube_width', 2.0):.2f} % of cube)")
-            psim.TextUnformatted(f"  max fit->tgt  {err['fit_to_target_max']:.3e}")
-            psim.TextUnformatted(f"  max tgt->fit  {err['target_to_fit_max']:.3e}")
+            if "fit_to_target_max" in err:
+                psim.TextUnformatted(f"  max fit->tgt  {err['fit_to_target_max']:.3e}")
+                psim.TextUnformatted(f"  max tgt->fit  {err['target_to_fit_max']:.3e}")
+            if "cd" in err:                                    # written by benchmark_warp.py
+                psim.TextUnformatted(f"  chamfer (CD)  {err['cd']:.3e}   pieces {err.get('pieces', '?')}")
+            if "method" in err:
+                psim.TextUnformatted(f"  method        {err['method']}, seed {err.get('seed', '?')}")
+                psim.TextUnformatted(f"  own loss      {err.get('own_loss', float('nan')):.3e}   "
+                                     f"time {err.get('time', float('nan')):.1f} s")
         if psim.TreeNode("Pruning per level"):
             for lvl, tested, kept in st.get("levels", []):
                 psim.TextUnformatted(f"level {lvl}: {kept:6d} of {tested:6d} kept")
@@ -384,7 +409,9 @@ def main():
     ap.add_argument("--depth", type=int, default=5)
     ap.add_argument("--level", type=float, default=0.0)
     ap.add_argument("--load", help="fit file from warp_optimize.py or optimize.py")
+    add_box_arguments(ap)
     args = ap.parse_args()
+    S.box = S.preset_box = box_from_args(args)
 
     S.entry_idx = list(WARP_PRESETS).index(args.preset)
     S.values = list(args.values) if args.values else list(WARP_PRESETS[args.preset])
