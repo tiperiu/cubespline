@@ -31,17 +31,25 @@ Columns
   RMS        sqrt(CD / 2): root-mean-square distance, world units
   pieces     connected pieces of the fitted surface (target: 1)
 
-Usage:
-    python benchmark_warp.py                                   # sphere, sphere cap, sphere flank; seeds 0 1 2
-    python benchmark_warp.py --targets "torus inner" --seeds 0
-    python benchmark_warp.py --out benchmark/benchmark_warp.json --save-fits benchmark
-                                   # also save the best seed of every method as a fit file + overview_best.png
-    python benchmark_warp.py --save-fits benchmark --save-all-seeds   # every run, + median / worst overviews
-    python benchmark_warp.py --from-json benchmark/benchmark_warp.json --save-fits benchmark   # from an earlier run
-    cd benchmark && python ../warp_viewer.py                          # the saved fits in the combo box
+Results go to data/benchmark/ (benchmark_warp.json; with --save-fits also the fit files
+and overview_best.png).
+
+Usage (from the project folder):
+    python code/benchmark/benchmark_warp.py --save-fits       # sphere, sphere cap, sphere flank; seeds 0 1 2
+    python code/benchmark/benchmark_warp.py --targets "torus inner" --seeds 0
+    python code/benchmark/benchmark_warp.py --save-fits --save-all-seeds   # every seed, + median / worst overviews
+    python code/benchmark/benchmark_warp.py --from-json data/benchmark/benchmark_warp.json --save-fits
+                                                                # from an earlier run, no rerun
+    python code/visualization/warp_viewer.py                  # the saved fits are in the combo box
 """
 
 from __future__ import annotations
+
+import sys as _sys
+from pathlib import Path as _Path
+_CODE = str(_Path(__file__).resolve().parents[1])          # .../code: makes `import core...` work
+if _CODE not in _sys.path:                                  # when this file is run as a script
+    _sys.path.insert(0, _CODE)
 
 import argparse
 import json
@@ -50,9 +58,10 @@ import time
 import numpy as np
 import torch
 
-import classify_optimize as C
-import optimize as O
-import warp_optimize as WO
+import optimization.classify_optimize as C
+import optimization.optimize as O
+import optimization.warp_optimize as WO
+from core.paths import BENCHMARK, find_input, output_path
 
 DT = torch.float64
 METHODS = ["sampson", "chamfer", "logistic", "logistic lattice", "es", "es lattice", "grpo", "grpo lattice"]
@@ -278,15 +287,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--targets", nargs="+", default=["sphere", "sphere cap", "sphere flank"])
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
-    ap.add_argument("--out", default="benchmark_warp.json")
-    ap.add_argument("--save-fits", metavar="DIR", help="also write the best seed of every method as a fit file for warp_viewer.py, "
-                                                       "plus overview images, into DIR")
+    ap.add_argument("--out", help="result file (default data/benchmark/benchmark_warp.json)")
+    ap.add_argument("--save-fits", metavar="DIR", nargs="?", const=str(BENCHMARK),
+                    help="also write the best seed of every method as a fit file for warp_viewer.py "
+                         "(into DIR, default data/benchmark), plus overview images")
     ap.add_argument("--save-all-seeds", action="store_true",
                     help="with --save-fits: save every seed, not only the best one of each method")
     ap.add_argument("--from-json", metavar="FILE", help="do not run: load results from FILE (an earlier --out)")
     args = ap.parse_args()
+    out = args.out or output_path("benchmark_warp.json", BENCHMARK)
     if args.from_json:
-        with open(args.from_json) as fh:
+        with open(find_input(args.from_json)) as fh:
             results = json.load(fh)
         if args.save_fits:
             save_fits(results, args.save_fits, all_seeds=args.save_all_seeds)
@@ -311,7 +322,7 @@ def main():
                 results.append(rec)
                 print(f"{name:12s} seed {seed}  {m:16s} {r['time']:6.1f}s  own loss {r['own_loss']:.3e}  "
                       f"CD {cd:.3e}  RMS {rms:.3e}  pieces {pieces}", flush=True)
-            with open(args.out, "w") as fh:
+            with open(out, "w") as fh:
                 json.dump(results, fh, indent=1)
     if args.save_fits:
         save_fits(results, args.save_fits, all_seeds=args.save_all_seeds)

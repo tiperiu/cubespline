@@ -1,7 +1,13 @@
 """
 Tests for cubes at arbitrary positions and sizes (box.py) and the grid preparation.
-Run:  python -m pytest test_box.py -q      (or  python test_box.py)
+Run:  python -m pytest code/tests/test_box.py -q      (or  python code/tests/test_box.py)
 """
+
+import sys as _sys
+from pathlib import Path as _Path
+_CODE = str(_Path(__file__).resolve().parents[1])          # .../code: makes `import core...` work
+if _CODE not in _sys.path:                                  # when this file is run as a script
+    _sys.path.insert(0, _CODE)
 
 import json
 import os
@@ -10,13 +16,13 @@ import tempfile
 import numpy as np
 import torch
 
-import optimize as O
-import warp_marching as WM
-import warp_optimize as WO
-from box import Box, corner_vertex_ids
-from cube import Cube
-from marching import extract_topology
-from warpcube import WarpCube
+import optimization.optimize as O
+import core.warp_marching as WM
+import optimization.warp_optimize as WO
+from core.box import Box, corner_vertex_ids
+from core.cube import Cube
+from core.marching import extract_topology
+from core.warpcube import WarpCube
 
 DT = torch.float64
 RNG = np.random.default_rng(0)

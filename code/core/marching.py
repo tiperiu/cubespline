@@ -51,7 +51,7 @@ from functools import lru_cache
 import numpy as np
 import torch
 
-from cube import CORNER_IJK, CUBE_EDGES, Cube
+from core.cube import CORNER_IJK, CUBE_EDGES, Cube
 
 # ----------------------------------------------------------------------------
 # Cube combinatorics

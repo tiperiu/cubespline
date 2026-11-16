@@ -1,17 +1,23 @@
 """
 Tests for warpcube.py, warp_marching.py and warp_optimize.py.
-Run:  python test_warp.py   (or pytest)
+Run:  python code/tests/test_warp.py   (or pytest)
 """
+
+import sys as _sys
+from pathlib import Path as _Path
+_CODE = str(_Path(__file__).resolve().parents[1])          # .../code: makes `import core...` work
+if _CODE not in _sys.path:                                  # when this file is run as a script
+    _sys.path.insert(0, _CODE)
 
 import numpy as np
 import torch
 
-import optimize as O
-import warp_marching as WM
-import warp_optimize as W
-from cube import Cube
-from marching import marching_cubes as mc8, mesh_check, to_numpy
-from warpcube import WarpCube, WARP_PRESETS, field_local_np
+import optimization.optimize as O
+import core.warp_marching as WM
+import optimization.warp_optimize as W
+from core.cube import Cube
+from core.marching import marching_cubes as mc8, mesh_check, to_numpy
+from core.warpcube import WarpCube, WARP_PRESETS, field_local_np
 
 RNG = np.random.default_rng(0)
 

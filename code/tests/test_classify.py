@@ -1,7 +1,13 @@
 """
 Tests for classify_optimize.py (inside/outside classification: logistic and ES).
-Run:  python -m pytest test_classify.py -q      (or  python test_classify.py)
+Run:  python -m pytest code/tests/test_classify.py -q      (or  python code/tests/test_classify.py)
 """
+
+import sys as _sys
+from pathlib import Path as _Path
+_CODE = str(_Path(__file__).resolve().parents[1])          # .../code: makes `import core...` work
+if _CODE not in _sys.path:                                  # when this file is run as a script
+    _sys.path.insert(0, _CODE)
 
 import json
 import os
@@ -10,9 +16,9 @@ import tempfile
 import numpy as np
 import torch
 
-import classify_optimize as C
-import optimize as O
-from box import Box
+import optimization.classify_optimize as C
+import optimization.optimize as O
+from core.box import Box
 
 DT = torch.float64
 

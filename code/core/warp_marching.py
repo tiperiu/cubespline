@@ -38,9 +38,9 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from cube import CORNER_IJK
-from marching import SNAP_REL, _mesh_cells, mesh_check, save_obj, to_numpy  # noqa: F401
-from warpcube import WarpCube, field_world, gradient_world, trilinear_np, warp_local_np
+from core.cube import CORNER_IJK
+from core.marching import SNAP_REL, _mesh_cells, mesh_check, save_obj, to_numpy  # noqa: F401
+from core.warpcube import WarpCube, field_world, gradient_world, trilinear_np, warp_local_np
 
 
 @dataclass

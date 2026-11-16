@@ -24,18 +24,24 @@ Two stages, each with its own iteration count:
              --no-refine        stage 1 only (same as --refine-iters 0)
 
 Usage:
-    python warp_optimize.py --target "sphere cap"
-    python warp_optimize.py --target "sphere cap" --start-iters 200 --refine-iters 500
-    python warp_optimize.py --target "sphere cap" --no-refine
-    python warp_optimize.py --target "sphere cap" --init regular   # start at the 8-value fit only
-    python warp_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1   # a smaller cube elsewhere
-    python warp_optimize.py --target "torus inner flank" --depth 5 --refine-iters 400 --out warp_torus.json
-    python warp_optimize.py --target "sphere cap" --view          # live window
-    python warp_optimize.py --list
-View a result with   python warp_viewer.py   (fits appear in the combo box).
+    python code/optimization/warp_optimize.py --target "sphere cap"
+    python code/optimization/warp_optimize.py --target "sphere cap" --start-iters 200 --refine-iters 500
+    python code/optimization/warp_optimize.py --target "sphere cap" --no-refine
+    python code/optimization/warp_optimize.py --target "sphere cap" --init regular   # start at the 8-value fit only
+    python code/optimization/warp_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1   # a smaller cube elsewhere
+    python code/optimization/warp_optimize.py --target "torus inner flank" --depth 5 --refine-iters 400 --out warp_torus.json
+    python code/optimization/warp_optimize.py --target "sphere cap" --view          # live window
+    python code/optimization/warp_optimize.py --list
+View a result with   python code/visualization/warp_viewer.py   (fits appear in the combo box).
 """
 
 from __future__ import annotations
+
+import sys as _sys
+from pathlib import Path as _Path
+_CODE = str(_Path(__file__).resolve().parents[1])          # .../code: makes `import core...` work
+if _CODE not in _sys.path:                                  # when this file is run as a script
+    _sys.path.insert(0, _CODE)
 
 import argparse
 import json
@@ -45,11 +51,12 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-import optimize as O
-from cube import Cube, CUBE_EDGES
-from marching import to_numpy
-from warpcube import WarpCube
-import warp_marching as WM
+import optimization.optimize as O
+from core.paths import output_path
+from core.cube import Cube, CUBE_EDGES
+from core.marching import to_numpy
+from core.warpcube import WarpCube
+import core.warp_marching as WM
 
 DT = torch.float64
 
@@ -366,7 +373,7 @@ def save_fit(path, fitter: WarpFitter, metrics=None):
 def view(fitter: WarpFitter):
     import polyscope as ps
     import polyscope.imgui as psim
-    from viewer import BASE_COLOR, BACK_COLOR, EDGE_COLOR, CUBE_COLOR, TARGET_COLOR
+    from visualization.viewer import BASE_COLOR, BACK_COLOR, EDGE_COLOR, CUBE_COLOR, TARGET_COLOR
 
     st = {"running": False, "steps": 1, "wire": True}
     ps.init()
@@ -466,7 +473,7 @@ def main():
     ap.add_argument("--starts", type=int, default=16, help="random starts for --init multistart")
     ap.add_argument("--seed", type=int, default=0)
     O.add_box_arguments(ap)
-    ap.add_argument("--out", default="warp_fit.json")
+    ap.add_argument("--out", help="output fit file (default data/fits/warp_fit.json)")
     ap.add_argument("--view", action="store_true")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
@@ -505,8 +512,9 @@ def main():
     print("offset", np.round(v[:8], 4).tolist())
     print("field ", np.round(v[8:], 4).tolist())
     print_final_error(final_error(fitter, metrics))
-    save_fit(args.out, fitter, metrics)
-    print(f"saved {args.out}  (view: python warp_viewer.py --load {args.out})")
+    out = args.out or output_path("warp_fit.json")
+    save_fit(out, fitter, metrics)
+    print(f"saved {out}  (view: python code/visualization/warp_viewer.py --load {out})")
 
 
 if __name__ == "__main__":

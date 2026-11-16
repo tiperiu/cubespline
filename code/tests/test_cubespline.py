@@ -1,14 +1,20 @@
 """
-Sanity tests for cube.py and marching.py.   Run:  python test_cubespline.py
+Sanity tests for cube.py and marching.py.   Run:  python code/tests/test_cubespline.py
 (also works with pytest).
 """
+
+import sys as _sys
+from pathlib import Path as _Path
+_CODE = str(_Path(__file__).resolve().parents[1])          # .../code: makes `import core...` work
+if _CODE not in _sys.path:                                  # when this file is run as a script
+    _sys.path.insert(0, _CODE)
 
 import numpy as np
 import torch
 
-from cube import Cube, PRESETS, CORNER_IJK
-import marching as M
-from marching import extract_topology, marching_cubes, mesh_check, to_numpy, _case_triangles
+from core.cube import Cube, PRESETS, CORNER_IJK
+import core.marching as M
+from core.marching import extract_topology, marching_cubes, mesh_check, to_numpy, _case_triangles
 
 torch.manual_seed(0)
 RNG = np.random.default_rng(0)

@@ -5,23 +5,49 @@ interpolation of the values; its level set `f = level` (default 0) is a surface.
 This repo extracts that surface with subdivided marching cubes, views it with
 Polyscope, and optimizes the 8 values so the surface matches a target.
 
+## Project layout
+
+```
+cubespline/
+  README.md  requirements.txt
+  code/
+    core/           cube representations, meshing, placement
+    optimization/   the optimizers
+    visualization/  the viewers
+    benchmark/      comparison of the optimizers
+    tests/          tests
+  data/
+    fits/           fit files written by the optimizers (default --out)
+    benchmark/      benchmark results, saved fits, overview images
+  docs/             documents
+```
+
 | file | what it does |
 |---|---|
-| `cube.py` | `Cube` (PyTorch `nn.Module`): 8 values as a parameter, `evaluate`, `basis`, `gradient`, `basis_gradient`, presets |
-| `marching.py` | octree subdivision with exact pruning + marching cubes → `V` (positions), `F` (connectivity); `mesh_from_grid` for any sampled function |
-| `viewer.py` | Polyscope viewer: cube, corner values, mesh, sliders for the values / depth / level; `--load fit.json` |
-| `optimize.py` | fit the 8 values to a target surface (function or mesh), live view with `--view` |
-| `test_cubespline.py`, `test_optimize.py` | tests |
-| `warpcube.py` | `WarpCube`: 16 values, 8 offsets + 8 field values (second version, see below) |
-| `warp_marching.py` | subdivided marching cubes for the 16-value cube |
-| `warp_optimize.py` | fit the 16 values to a target |
-| `warp_viewer.py` | viewer with 16 sliders, the warped cube and fit loading |
-| `test_warp.py` | tests for the 16-value cube |
-| `classify_optimize.py` | fit either cube by inside/outside classification: logistic loss + Adam, evolution strategies, or GRPO (reward only) |
-| `test_classify.py` | tests for the classification optimizers |
-| `box.py` | `Box`: where a cube sits (`lo`, `size`), lattices, `--lo/--size` options, grid helpers (`grid_cell`, `corner_vertex_ids`) |
-| `test_box.py` | tests for cubes at any position and size, and the grid preparation |
-| `benchmark_warp.py` | compares every 16-value optimizer (time, own loss, common chamfer distance) |
+| `code/core/cube.py` | `Cube` (PyTorch `nn.Module`): 8 values as a parameter, `evaluate`, `basis`, `gradient`, `basis_gradient`, presets |
+| `code/core/marching.py` | octree subdivision with exact pruning + marching cubes → `V` (positions), `F` (connectivity); `mesh_from_grid` for any sampled function |
+| `code/core/warpcube.py` | `WarpCube`: 16 values, 8 offsets + 8 field values (second version, see below) |
+| `code/core/warp_marching.py` | subdivided marching cubes for the 16-value cube |
+| `code/core/box.py` | `Box`: where a cube sits (`lo`, `size`), lattices, `--lo/--size` options, grid helpers (`grid_cell`, `corner_vertex_ids`) |
+| `code/core/paths.py` | the project folders (`data/fits`, `data/benchmark`) used for default outputs and by the viewers |
+| `code/optimization/optimize.py` | targets, and the fit of the 8 values to a target surface (function or mesh); live view with `--view` |
+| `code/optimization/warp_optimize.py` | fit the 16 values to a target |
+| `code/optimization/classify_optimize.py` | fit either cube by inside/outside classification: logistic loss + Adam, evolution strategies, or GRPO (reward only) |
+| `code/visualization/viewer.py` | Polyscope viewer: cube, corner values, mesh, sliders for the values / depth / level; `--load fit.json` |
+| `code/visualization/warp_viewer.py` | viewer with 16 sliders, the warped cube and fit loading |
+| `code/benchmark/benchmark_warp.py` | compares every 16-value optimizer (time, own loss, common chamfer distance) |
+| `code/tests/test_*.py` | tests: `test_cubespline`, `test_optimize`, `test_warp`, `test_classify`, `test_box` |
+
+**Running.** Run every script from anywhere, e.g. `python code/optimization/optimize.py`
+from the project folder: each script puts `code/` on the Python path itself, and
+inside the code the modules import each other as packages (`from core.cube import
+Cube`). In PyCharm, optionally mark `code/` as a Sources Root so it resolves the
+imports in the editor.
+
+**Data.** Unless `--out` says otherwise, the optimizers write their fit files to
+`data/fits/` and the benchmark writes to `data/benchmark/`. The viewers list the fit
+files of the folder they are started from, `data/fits` and `data/benchmark`, and
+`--load NAME` also finds a file by name in those two folders.
 
 ## Setup
 
@@ -29,21 +55,22 @@ Polyscope, and optimizes the 8 values so the surface matches a target.
 cd cubespline
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python test_cubespline.py && python test_optimize.py   # quick self-check
-python test_warp.py && python test_classify.py && python test_box.py
+python -m pytest code/tests -q                         # all tests (39), about 1.5 min
+python code/tests/test_cubespline.py                   # or one file at a time
 ```
 
 ## Use
 
 ```bash
-python viewer.py                                   # preset "bowl", depth 4
-python viewer.py --preset checkerboard --depth 6
-python viewer.py --values -1 1 1 1 1 1 1 -1 --depth 5
+python code/visualization/viewer.py                                   # preset "bowl", depth 4
+python code/visualization/viewer.py --preset checkerboard --depth 6
+python code/visualization/viewer.py --values -1 1 1 1 1 1 1 -1 --depth 5
 ```
 
 ```python
-from cube import Cube
-from marching import marching_cubes, save_obj
+# with code/ on the Python path (e.g. run from code/, or code/ as a PyCharm Sources Root)
+from core.cube import Cube
+from core.marching import marching_cubes, save_obj
 
 cube = Cube([-1, 1, 1, 1, 1, 1, 1, -1])     # corner n = i + 2j + 4k, cube [-1,1]^3
 V, F, topo = marching_cubes(cube, depth=5)  # V: torch (nv,3), F: int64 (nf,3)
@@ -88,16 +115,16 @@ on the cube faces.
 ## Fitting the 8 values (`optimize.py`)
 
 ```bash
-python optimize.py --list                          # built-in targets and loss terms
-python optimize.py --target 'sphere flank'         # headless: prints progress, writes fit.json
-python optimize.py --target 'sphere flank' --no-refine   # closed-form start only
-python optimize.py --target torus --view           # live: Run / Step / Reset, loss plot
-python optimize.py --mesh my.obj --loss chamfer=1 --loss normal=0.1
-python viewer.py --load fit.json                   # inspect the result
+python code/optimization/optimize.py --list                          # built-in targets and loss terms
+python code/optimization/optimize.py --target 'sphere flank'         # prints progress, writes data/fits/fit.json
+python code/optimization/optimize.py --target 'sphere flank' --no-refine   # closed-form start only
+python code/optimization/optimize.py --target torus --view           # live: Run / Step / Reset, loss plot
+python code/optimization/optimize.py --mesh my.obj --loss chamfer=1 --loss normal=0.1
+python code/visualization/viewer.py --load fit.json                   # inspect the result
 ```
 
-In the viewer, every `*.json` fit in the folder you run it from appears in the
-**preset / fit** combo box as `fit: <file> (<target>)`. Selecting one sets its values
+In the viewer, every `*.json` fit in the folder you run it from, in `data/fits` and in
+`data/benchmark` appears in the **preset / fit** combo box as `fit: <file> (<target>)`. Selecting one sets its values
 and depth and draws its target surface in transparent orange. **Load fit** opens
 any other fit file by path; **Rescan \*.json** picks up fits written while the viewer
 is open.
@@ -180,7 +207,7 @@ What this shows:
 ### Slices of a large sphere or torus
 
 One cube cannot close a surface, so the realistic targets are patches of big
-shapes clipped by the cube. These slices are built in (`python optimize.py --list`):
+shapes clipped by the cube. These slices are built in (`python code/optimization/optimize.py --list`):
 
 | target | apex / crest | RMS | max distance |
 |---|---|---|---|
@@ -221,10 +248,10 @@ Every cube is an axis-aligned cube `[lo, lo + size]³`, by default `[-1, 1]³`. 
 the optimizers and both viewers take `--lo X Y Z` and `--size S`:
 
 ```bash
-python optimize.py --target "sphere cap" --lo 0 -1 0 --size 1        # a corner octant of the default cube
-python warp_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1
-python classify_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1
-python viewer.py --preset saddle --lo 2 0 0 --size 0.5
+python code/optimization/optimize.py --target "sphere cap" --lo 0 -1 0 --size 1        # a corner octant of the default cube
+python code/optimization/warp_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1
+python code/optimization/classify_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1
+python code/visualization/viewer.py --preset saddle --lo 2 0 0 --size 0.5
 ```
 
 * **Targets live in world space** and are clipped to the cube. The built-in
@@ -282,13 +309,13 @@ cube; the tests check that the mesher gives identical meshes then. The offset ru
 is the single function `offset_local` in `warpcube.py`.
 
 ```bash
-python warp_optimize.py --target "sphere cap"              # writes warp_fit.json
-python warp_optimize.py --target "sphere cap" --start-iters 200 --refine-iters 500
-python warp_optimize.py --target "sphere cap" --no-refine  # stage 1 only
-python warp_optimize.py --target "torus inner" --out warp_torus_inner.json
-python warp_optimize.py --target "sphere cap" --view       # live window
-python warp_viewer.py                                      # 16 sliders; fits in the combo box
-python test_warp.py
+python code/optimization/warp_optimize.py --target "sphere cap"              # writes data/fits/warp_fit.json
+python code/optimization/warp_optimize.py --target "sphere cap" --start-iters 200 --refine-iters 500
+python code/optimization/warp_optimize.py --target "sphere cap" --no-refine  # stage 1 only
+python code/optimization/warp_optimize.py --target "torus inner" --out warp_torus_inner.json
+python code/optimization/warp_optimize.py --target "sphere cap" --view       # live window
+python code/visualization/warp_viewer.py                                      # 16 sliders; fits in the combo box
+python code/tests/test_warp.py
 ```
 
 **Mesher (`warp_marching.py`).** f is no longer trilinear, so three parts change:
@@ -320,8 +347,9 @@ Iteration counts, per stage:
 | `--starts K` | 1: number of random starts (plus the 8-value fit) | 16 |
 | `--start-iters N` | 1: L-BFGS iterations per start | 100 |
 | `--refine-iters M` | 2: Adam steps of the chamfer refinement (`--iters` is an alias) | 300 |
-| `--no-refine` | skip stage 2 (same as `--refine-iters 0`) | | Losses:
-`chamfer`, `algebraic`, `normal`, and `offset` (keeps offsets small). The final error
+| `--no-refine` | skip stage 2 (same as `--refine-iters 0`) | |
+
+Losses: `chamfer`, `algebraic`, `normal`, and `offset` (keeps offsets small). The final error
 report and the `final_error` block in the fit file have the same format as `optimize.py`.
 
 **Why it helps.** The 8-value cube's level set is monotone in every axis-aligned
@@ -397,15 +425,15 @@ starts plus the 8-value solution (zero offset) for `--start-iters` steps each.
 The best one continues for `--iters` steps.
 
 ```bash
-python classify_optimize.py --target "sphere flank"                       # 8 values, logistic
-python classify_optimize.py --target "sphere flank" --method es
-python classify_optimize.py --cube 16 --target "sphere cap"               # 16 values
-python classify_optimize.py --cube 16 --target "sphere cap" --method es --iters 600
-python classify_optimize.py --cube 16 --target "torus inner" --method grpo
-python classify_optimize.py --cube 16 --target "sphere cap" --chamfer-iters 200   # then chamfer refinement
-python classify_optimize.py --cube 16 --target "sphere cap" --sampling lattice           # 10x10x10 = 1000 points
-python classify_optimize.py --cube 16 --target "sphere cap" --sampling lattice --k 20 --lattice-faces
-python warp_viewer.py --load classify_warp_fit.json                       # view (8-value: viewer.py --load classify_fit.json)
+python code/optimization/classify_optimize.py --target "sphere flank"                       # 8 values, logistic
+python code/optimization/classify_optimize.py --target "sphere flank" --method es
+python code/optimization/classify_optimize.py --cube 16 --target "sphere cap"               # 16 values
+python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --method es --iters 600
+python code/optimization/classify_optimize.py --cube 16 --target "torus inner" --method grpo
+python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --chamfer-iters 200   # then chamfer refinement
+python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --sampling lattice           # 10x10x10 = 1000 points
+python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --sampling lattice --k 20 --lattice-faces
+python code/visualization/warp_viewer.py --load classify_warp_fit.json                       # view (8-value: viewer.py --load classify_fit.json)
 ```
 
 | option | default | meaning |
@@ -498,8 +526,15 @@ above). The lattice is 10³ = 1000 or 20³ = 8000 cell-centre points.
 
 ## Benchmark: all optimizers of the 16-value cube on the three sphere targets
 
-`python benchmark_warp.py` (about 12 min) runs every method with its default
+`python code/benchmark/benchmark_warp.py` (about 12 min) runs every method with its default
 settings on `sphere`, `sphere cap` and `sphere flank`, with 3 seeds each.
+
+```bash
+python code/benchmark/benchmark_warp.py --save-fits     # results, best fits and overview_best.png -> data/benchmark/
+python code/benchmark/benchmark_warp.py --save-fits --save-all-seeds   # every seed, + median / worst overviews
+python code/benchmark/benchmark_warp.py --from-json data/benchmark/benchmark_warp.json   # tables again, no rerun
+python code/visualization/warp_viewer.py                # the saved fits are in the combo box
+```
 
 * **Own loss** is the objective each method minimises, at its result. It can only
   be compared within a row:

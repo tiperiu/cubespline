@@ -8,12 +8,18 @@ Rendering follows the libigl playground viewer: Polyscope, y-up, shadow-only
 ground plane, same mesh colours and panel layout.
 
 Usage:
-    python viewer.py                                  # preset "bowl", depth 4
-    python viewer.py --preset saddle --depth 6
-    python viewer.py --values -1 1 1 1 1 1 1 -1 --depth 5 --level 0.2
-    python viewer.py --load fit.json                  # result of optimize.py
-    python viewer.py --preset saddle --lo 2 0 0 --size 0.5   # the cube elsewhere, smaller
+    python code/visualization/viewer.py                                  # preset "bowl", depth 4
+    python code/visualization/viewer.py --preset saddle --depth 6
+    python code/visualization/viewer.py --values -1 1 1 1 1 1 1 -1 --depth 5 --level 0.2
+    python code/visualization/viewer.py --load fit.json                  # result of optimize.py
+    python code/visualization/viewer.py --preset saddle --lo 2 0 0 --size 0.5   # the cube elsewhere, smaller
 """
+
+import sys as _sys
+from pathlib import Path as _Path
+_CODE = str(_Path(__file__).resolve().parents[1])          # .../code: makes `import core...` work
+if _CODE not in _sys.path:                                  # when this file is run as a script
+    _sys.path.insert(0, _CODE)
 
 import argparse
 import glob
@@ -27,9 +33,12 @@ import numpy as np
 import polyscope as ps
 import polyscope.imgui as psim
 
-from box import Box, add_box_arguments, box_from_args
-from cube import Cube, CUBE_EDGES, CORNER_IJK, PRESETS
-from marching import extract_topology, mesh_check, save_obj, to_numpy
+from pathlib import Path
+
+from core.box import Box, add_box_arguments, box_from_args
+from core.paths import FIT_FOLDERS, FITS, find_input
+from core.cube import Cube, CUBE_EDGES, CORNER_IJK, PRESETS
+from core.marching import extract_topology, mesh_check, save_obj, to_numpy
 
 BASE_COLOR = (0.75, 0.80, 0.95)        # same as libigl playground
 BACK_COLOR = (0.95, 0.70, 0.45)        # inside (f < level) side of the surface
@@ -186,8 +195,9 @@ def choose_file(start_dir="."):
 
 
 def load_fit(path):
-    """Read a fit.json from optimize.py, add it to the combo box and show it."""
-    path = clean_path(path)
+    """Read a fit.json from optimize.py, add it to the combo box and show it.
+    A bare file name is also looked up in data/fits and data/benchmark."""
+    path = find_input(clean_path(path))
     try:
         with open(path) as fh:
             fit = json.load(fh)
@@ -215,6 +225,12 @@ def load_fit(path):
     S.message = f"Loaded {os.path.basename(path)}: target {target}" + (f", rms {rms:.3g}" if rms else "")
     print(S.message)
     return True
+
+
+def fit_folders():
+    """Folders whose fit files are listed in the combo box: the current folder,
+    data/fits and data/benchmark."""
+    return [str(f) for f in dict.fromkeys([Path.cwd(), *FIT_FOLDERS]) if Path(f).is_dir()]
 
 
 def scan_fits(folder="."):
@@ -248,7 +264,7 @@ def draw_target(target):
     if not target:
         return
     try:
-        import optimize as O
+        import optimization.optimize as O
         if target in O.FUNCTIONS or target == "trilinear":
             t = O.builtin_target(target, n=500, box=S.box)
         elif os.path.isfile(target):
@@ -343,7 +359,7 @@ def ui():
         psim.TextUnformatted(f"cube {S.box}")
         _, S.fit_path = psim.InputText("fit file", S.fit_path)
         if psim.Button("Browse..."):
-            start = os.path.dirname(clean_path(S.fit_path)) or "."
+            start = os.path.dirname(clean_path(S.fit_path)) or str(FITS)
             p = choose_file(start if os.path.isdir(start) else ".")
             if p:
                 S.fit_path = p
@@ -362,7 +378,8 @@ def ui():
         psim.SameLine()
         if psim.Button("Rescan *.json"):
             n = len(S.entries)
-            scan_fits(os.path.dirname(os.path.abspath(S.fit_path)) or ".")
+            for folder in dict.fromkeys([os.path.dirname(os.path.abspath(S.fit_path)), *fit_folders()]):
+                scan_fits(folder)
             S.message = f"Found {len(S.entries) - n} new fit file(s)"
         r = S.slider_range
         for n in range(8):
@@ -482,8 +499,7 @@ def main():
     ps.set_ground_plane_mode("shadow_only")
 
     draw_cube_frame()
-    here = os.path.dirname(os.path.abspath(__file__))
-    for folder in dict.fromkeys([os.getcwd(), here]):   # fits where you run it and next to the code
+    for folder in fit_folders():                        # fits where you run it, data/fits, data/benchmark
         scan_fits(folder)
     if args.load:
         S.fit_path = args.load

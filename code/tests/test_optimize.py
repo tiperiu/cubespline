@@ -1,12 +1,18 @@
 """
-Tests for optimize.py.   Run:  python test_optimize.py   (or pytest)
+Tests for optimize.py.   Run:  python code/tests/test_optimize.py   (or pytest)
 """
+
+import sys as _sys
+from pathlib import Path as _Path
+_CODE = str(_Path(__file__).resolve().parents[1])          # .../code: makes `import core...` work
+if _CODE not in _sys.path:                                  # when this file is run as a script
+    _sys.path.insert(0, _CODE)
 
 import numpy as np
 import torch
 
-import optimize as O
-from cube import Cube
+import optimization.optimize as O
+from core.cube import Cube
 
 
 def test_algebraic_init_recovers_trilinear():

@@ -11,11 +11,17 @@ Fits written by warp_optimize.py (16 values) and by optimize.py (8 values, shown
 with zero offset) appear in the "preset / fit" combo box.
 
 Usage:
-    python warp_viewer.py
-    python warp_viewer.py --preset "twisted plane" --depth 6
-    python warp_viewer.py --load warp_fit.json
-    python warp_viewer.py --preset "twisted plane" --lo 2 0 0 --size 0.5   # elsewhere, smaller
+    python code/visualization/warp_viewer.py
+    python code/visualization/warp_viewer.py --preset "twisted plane" --depth 6
+    python code/visualization/warp_viewer.py --load warp_fit.json
+    python code/visualization/warp_viewer.py --preset "twisted plane" --lo 2 0 0 --size 0.5   # elsewhere, smaller
 """
+
+import sys as _sys
+from pathlib import Path as _Path
+_CODE = str(_Path(__file__).resolve().parents[1])          # .../code: makes `import core...` work
+if _CODE not in _sys.path:                                  # when this file is run as a script
+    _sys.path.insert(0, _CODE)
 
 import argparse
 import glob
@@ -28,13 +34,14 @@ import polyscope as ps
 import polyscope.imgui as psim
 import torch
 
-from box import Box, add_box_arguments, box_from_args
-from cube import CUBE_EDGES, CORNER_IJK
-from marching import mesh_check, save_obj, to_numpy
-from viewer import (BASE_COLOR, BACK_COLOR, EDGE_COLOR, CUBE_COLOR, CELL_COLOR, TARGET_COLOR,
-                    clean_path, clipboard_text, choose_file)
-from warpcube import WarpCube, WARP_PRESETS
-import warp_marching as WM
+from core.box import Box, add_box_arguments, box_from_args
+from core.paths import FITS, find_input
+from core.cube import CUBE_EDGES, CORNER_IJK
+from core.marching import mesh_check, save_obj, to_numpy
+from visualization.viewer import (BASE_COLOR, BACK_COLOR, EDGE_COLOR, CUBE_COLOR, CELL_COLOR, TARGET_COLOR,
+                    clean_path, clipboard_text, choose_file, fit_folders)
+from core.warpcube import WarpCube, WARP_PRESETS
+import core.warp_marching as WM
 
 WARP_COLOR = (0.2, 0.5, 0.9)
 MAX_CELLS_DRAWN = 40000
@@ -101,7 +108,7 @@ def _read_fit(path):
 
 
 def load_fit(path):
-    path = clean_path(path)
+    path = find_input(clean_path(path))            # a bare name is also looked up in data/fits, data/benchmark
     try:
         entry = _entry_from_fit(path, _read_fit(path))
     except Exception as e:  # noqa: BLE001
@@ -166,7 +173,7 @@ def draw_target(target):
     if not target:
         return
     try:
-        import optimize as O
+        import optimization.optimize as O
         if target in O.FUNCTIONS or target == "trilinear":
             t = O.builtin_target(target, n=500, box=S.box)
         elif os.path.isfile(target):
@@ -293,7 +300,7 @@ def ui():
         psim.TextUnformatted(f"cube {S.box}")
         _, S.fit_path = psim.InputText("fit file", S.fit_path)
         if psim.Button("Browse..."):
-            p = choose_file(".")
+            p = choose_file(str(FITS) if FITS.is_dir() else ".")
             if p:
                 S.fit_path = p
                 dirty |= load_fit(p)
@@ -307,7 +314,8 @@ def ui():
             dirty |= load_fit(S.fit_path)
         psim.SameLine()
         if psim.Button("Rescan *.json"):
-            scan_fits(".")
+            for folder in fit_folders():
+                scan_fits(folder)
         if psim.TreeNodeEx("Offsets (corner moves along its diagonal)", psim.ImGuiTreeNodeFlags_DefaultOpen):
             for n in range(8):
                 i, j, k = CORNER_IJK[n]
@@ -422,8 +430,7 @@ def main():
     ps.set_up_dir("y_up")
     ps.set_ground_plane_mode("shadow_only")
     draw_cube_frame()
-    here = os.path.dirname(os.path.abspath(__file__))
-    for folder in dict.fromkeys([os.getcwd(), here]):
+    for folder in fit_folders():                        # fits where you run it, data/fits, data/benchmark
         scan_fits(folder)
     if args.load:
         S.fit_path = args.load

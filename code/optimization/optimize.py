@@ -19,16 +19,23 @@ Conventions as in marching.py: inside is f < 0, normals point towards +f, so a
 target mesh should have outward-facing normals (f > 0 outside the target).
 
 Usage:
-    python optimize.py --target sphere --depth 5 --refine-iters 300
-    python optimize.py --target "sphere flank" --no-refine     # closed-form start only
-    python optimize.py --target trilinear --view          # watch it converge
-    python optimize.py --target "sphere cap" --lo 0 -1 0 --size 1   # a smaller cube elsewhere
-    python optimize.py --mesh bunny.obj --loss chamfer=1 --loss algebraic=0.1
-    python optimize.py --list
-The fitted values are written to fit.json; open them with  python viewer.py --load fit.json
+    python code/optimization/optimize.py --target sphere --depth 5 --refine-iters 300
+    python code/optimization/optimize.py --target "sphere flank" --no-refine     # closed-form start only
+    python code/optimization/optimize.py --target trilinear --view          # watch it converge
+    python code/optimization/optimize.py --target "sphere cap" --lo 0 -1 0 --size 1   # a smaller cube elsewhere
+    python code/optimization/optimize.py --mesh bunny.obj --loss chamfer=1 --loss algebraic=0.1
+    python code/optimization/optimize.py --list
+The fitted values are written to data/fits/fit.json (--out to change it); open them with
+    python code/visualization/viewer.py --load fit.json
 """
 
 from __future__ import annotations
+
+import sys as _sys
+from pathlib import Path as _Path
+_CODE = str(_Path(__file__).resolve().parents[1])          # .../code: makes `import core...` work
+if _CODE not in _sys.path:                                  # when this file is run as a script
+    _sys.path.insert(0, _CODE)
 
 import argparse
 import json
@@ -38,9 +45,10 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from box import Box, add_box_arguments, box_from_args
-from cube import Cube, CUBE_EDGES
-from marching import extract_topology, mesh_from_grid, to_numpy
+from core.box import Box, add_box_arguments, box_from_args
+from core.paths import output_path
+from core.cube import Cube, CUBE_EDGES
+from core.marching import extract_topology, mesh_from_grid, to_numpy
 
 DT = torch.float64
 
@@ -593,7 +601,7 @@ def values_close_up_to_scale(a, b):
 def view(fitter: Fitter):
     import polyscope as ps
     import polyscope.imgui as psim
-    from viewer import BASE_COLOR, BACK_COLOR, EDGE_COLOR, CUBE_COLOR
+    from visualization.viewer import BASE_COLOR, BACK_COLOR, EDGE_COLOR, CUBE_COLOR
 
     TARGET_COLOR = (0.95, 0.55, 0.30)
     st = {"running": False, "steps_per_frame": 2, "show_target": True, "wire": True,
@@ -781,7 +789,7 @@ def main():
     ap.add_argument("--init", default="algebraic", choices=["algebraic", "random"])
     ap.add_argument("--seed", type=int, default=0)
     add_box_arguments(ap)
-    ap.add_argument("--out", default="fit.json")
+    ap.add_argument("--out", help="output fit file (default data/fits/fit.json)")
     ap.add_argument("--view", action="store_true", help="open the live Polyscope view instead of running headless")
     ap.add_argument("--list", action="store_true", help="list targets and losses")
     args = ap.parse_args()
@@ -816,8 +824,9 @@ def main():
     metrics = evaluate(fitter.values, target)           # same settings as final_error's initial RMS
     print("final values", np.round(fitter.values, 4).tolist())
     print_final_error(final_error(fitter, metrics))
-    save_fit(args.out, fitter, metrics)
-    print(f"saved {args.out}  (view: python viewer.py --load {args.out})")
+    out = args.out or output_path("fit.json")
+    save_fit(out, fitter, metrics)
+    print(f"saved {out}  (view: python code/visualization/viewer.py --load {out})")
 
 
 if __name__ == "__main__":

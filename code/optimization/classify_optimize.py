@@ -85,20 +85,26 @@ same RMS distance as optimize.py / warp_optimize.py. --chamfer-iters N then
 refines the result with the chamfer optimizer of those modules.
 
 Usage:
-    python classify_optimize.py --target "sphere flank"                         # 8 values, logistic
-    python classify_optimize.py --target "sphere flank" --method es
-    python classify_optimize.py --cube 16 --target "sphere cap"                 # 16 values, logistic
-    python classify_optimize.py --cube 16 --target "sphere cap" --method es --iters 600
-    python classify_optimize.py --cube 16 --target "sphere cap" --method grpo
-    python classify_optimize.py --cube 16 --target "torus inner" --chamfer-iters 200
-    python classify_optimize.py --cube 16 --target "sphere cap" --method grpo --sampling lattice --k 10
-    python classify_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1     # a smaller cube elsewhere
-    python classify_optimize.py --list
+    python code/optimization/classify_optimize.py --target "sphere flank"                         # 8 values, logistic
+    python code/optimization/classify_optimize.py --target "sphere flank" --method es
+    python code/optimization/classify_optimize.py --cube 16 --target "sphere cap"                 # 16 values, logistic
+    python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --method es --iters 600
+    python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --method grpo
+    python code/optimization/classify_optimize.py --cube 16 --target "torus inner" --chamfer-iters 200
+    python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --method grpo --sampling lattice --k 10
+    python code/optimization/classify_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1     # a smaller cube elsewhere
+    python code/optimization/classify_optimize.py --list
 Fits are saved in the same format as optimize.py (8) / warp_optimize.py (16), so
 viewer.py and warp_viewer.py show them in their combo boxes.
 """
 
 from __future__ import annotations
+
+import sys as _sys
+from pathlib import Path as _Path
+_CODE = str(_Path(__file__).resolve().parents[1])          # .../code: makes `import core...` work
+if _CODE not in _sys.path:                                  # when this file is run as a script
+    _sys.path.insert(0, _CODE)
 
 import argparse
 import json
@@ -109,11 +115,12 @@ import numpy as np
 import torch
 import torch.nn.functional as Fn
 
-import optimize as O
-import warp_optimize as WO
-from box import Box, add_box_arguments, box_from_args
-from cube import Cube
-from warpcube import CORNER_DIR, field_world
+import optimization.optimize as O
+import optimization.warp_optimize as WO
+from core.box import Box, add_box_arguments, box_from_args
+from core.paths import output_path
+from core.cube import Cube
+from core.warpcube import CORNER_DIR, field_world
 
 DT = torch.float64
 
@@ -493,12 +500,12 @@ def count_pieces(F: np.ndarray) -> int:
 def fitted_mesh(model: Model, v, depth):
     v = np.asarray(v, float)
     if model.n == 8:
-        from marching import extract_topology
+        from core.marching import extract_topology
         cube = Cube(v, requires_grad=False, **model.box.kw)
         topo = extract_topology(cube, depth)
     else:
-        import warp_marching as WM
-        from warpcube import WarpCube
+        import core.warp_marching as WM
+        from core.warpcube import WarpCube
         cube = WarpCube(v, requires_grad=False, **model.box.kw)
         topo = WM.extract_topology(cube, depth)
     with torch.no_grad():
@@ -610,7 +617,7 @@ def main():
     ap.add_argument("--depth", type=int, default=5)
     ap.add_argument("--seed", type=int, default=0)
     add_box_arguments(ap)
-    ap.add_argument("--out", help="default classify_fit.json (8) / classify_warp_fit.json (16)")
+    ap.add_argument("--out", help="output fit file (default data/fits/classify_fit.json, or classify_warp_fit.json for 16)")
     ap.add_argument("--list", action="store_true", help="list targets")
     args = ap.parse_args()
 
@@ -624,7 +631,7 @@ def main():
                          group=args.group, grpo_epochs=args.grpo_epochs, clip=args.clip, kl_coef=args.kl_coef,
                          ref_every=args.ref_every, grpo_sigma=args.grpo_sigma, grpo_lr=args.grpo_lr,
                          sampling=args.sampling, k=args.k, lattice_faces=args.lattice_faces)
-    out = args.out or ("classify_fit.json" if args.cube == 8 else "classify_warp_fit.json")
+    out = args.out or output_path("classify_fit.json" if args.cube == 8 else "classify_warp_fit.json")
     target = O.builtin_target(args.target, box=box_from_args(args))
     print(f"target '{target.name}', {args.cube}-value cube in {target.box}, method {args.method}")
     t0 = time.time()
@@ -645,7 +652,8 @@ def main():
         err = err2
         print_report(err, "after chamfer refinement")
     save(out, args.cube, v.numpy(), target, args.depth, cfg, err, info, args.chamfer_iters)
-    print(f"saved {out}   (view: python {'viewer.py' if args.cube == 8 else 'warp_viewer.py'} --load {out})")
+    viewer = "code/visualization/" + ("viewer.py" if args.cube == 8 else "warp_viewer.py")
+    print(f"saved {out}   (view: python {viewer} --load {out})")
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from cube import CORNER_IJK, CUBE_EDGES, Cube, PRESETS
+from core.cube import CORNER_IJK, CUBE_EDGES, Cube, PRESETS
 
 # diagonal direction of each corner, (8, 3), entries +-1
 CORNER_DIR = (2 * CORNER_IJK - 1).astype(np.float64)
