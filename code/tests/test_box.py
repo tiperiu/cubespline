@@ -17,12 +17,9 @@ import numpy as np
 import torch
 
 import optimization.optimize as O
-import core.warp_marching as WM
-import optimization.warp_optimize as WO
 from core.box import Box, corner_vertex_ids
 from core.cube import Cube
 from core.marching import extract_topology
-from core.warpcube import WarpCube
 
 DT = torch.float64
 RNG = np.random.default_rng(0)
@@ -49,29 +46,22 @@ def test_files_without_a_box_are_the_default_cube():
 
 def test_same_values_same_shape_in_any_box():
     """f in a moved, scaled cube at the image of a local point equals f in the default
-    cube at that local point -- for 8 values and for 16 (offsets are in half-widths)."""
+    cube at that local point, and the meshes are the same, moved and scaled."""
     D = Box()
     U = torch.rand(300, 3, dtype=DT)
     v8 = RNG.normal(size=8)
-    v16 = np.r_[0.4 * RNG.normal(size=8), RNG.normal(size=8)]
     with torch.no_grad():
-        assert torch.allclose(Cube(v8, **MOVED.kw).evaluate(MOVED.to_world(U)),
-                              Cube(v8, **D.kw).evaluate(D.to_world(U)), atol=1e-12)
-        w_m, w_d = WarpCube(v16, **MOVED.kw), WarpCube(v16, **D.kw)
-        assert torch.allclose(w_m.evaluate(MOVED.to_world(U)), w_d.evaluate(D.to_world(U)), atol=1e-12)
-        assert torch.allclose(MOVED.to_local(w_m.moved_corners()), D.to_local(w_d.moved_corners()), atol=1e-12)
-        # the meshes are the same, moved and scaled
-        for cube_m, cube_d, mc in ((Cube(v8, **MOVED.kw), Cube(v8), extract_topology),
-                                   (w_m, w_d, WM.extract_topology)):
-            tm, td = mc(cube_m, 4), mc(cube_d, 4)
-            assert np.array_equal(tm.F, td.F)
-            assert torch.allclose(MOVED.to_local(tm.vertices(cube_m.values)),
-                                  D.to_local(td.vertices(cube_d.values)), atol=1e-9)
+        cube_m, cube_d = Cube(v8, **MOVED.kw), Cube(v8, **D.kw)
+        assert torch.allclose(cube_m.evaluate(MOVED.to_world(U)), cube_d.evaluate(D.to_world(U)), atol=1e-12)
+        tm, td = extract_topology(cube_m, 4), extract_topology(cube_d, 4)
+        assert np.array_equal(tm.F, td.F)
+        assert torch.allclose(MOVED.to_local(tm.vertices(cube_m.values)),
+                              D.to_local(td.vertices(cube_d.values)), atol=1e-9)
 
 
 def test_target_and_errors_follow_the_box():
     """A target moved and scaled with the cube gives the same samples (mapped) and
-    the same errors, scaled by the size ratio -- for both evaluators."""
+    the same errors, scaled by the size ratio."""
     D = Box()
     fn = O.FUNCTIONS["sphere cap"]
 
@@ -85,9 +75,6 @@ def test_target_and_errors_follow_the_box():
     v8, _ = O.fit_algebraic(None, t_d)
     e_d, e_m = O.evaluate(v8.numpy(), t_d, depth=4), O.evaluate(v8.numpy(), t_m, depth=4)
     assert np.isclose(e_m["rms"], ratio * e_d["rms"], rtol=1e-4), (e_m["rms"], ratio * e_d["rms"])
-    v16 = np.r_[0.3 * RNG.normal(size=8), v8.numpy()]
-    w_d, w_m = WO.evaluate(v16, t_d, depth=4), WO.evaluate(v16, t_m, depth=4)
-    assert np.isclose(w_m["rms"], ratio * w_d["rms"], rtol=1e-4)
 
 
 def test_fit_in_a_moved_box_and_save():

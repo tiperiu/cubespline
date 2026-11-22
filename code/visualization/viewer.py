@@ -196,7 +196,7 @@ def choose_file(start_dir="."):
 
 def load_fit(path):
     """Read a fit.json from optimize.py, add it to the combo box and show it.
-    A bare file name is also looked up in data/fits and data/benchmark."""
+    A bare file name is also looked up in data/fits."""
     path = find_input(clean_path(path))
     try:
         with open(path) as fh:
@@ -229,7 +229,7 @@ def load_fit(path):
 
 def fit_folders():
     """Folders whose fit files are listed in the combo box: the current folder,
-    data/fits and data/benchmark."""
+    data/fits (and data/fits/grid, whose grid fits it skips)."""
     return [str(f) for f in dict.fromkeys([Path.cwd(), *FIT_FOLDERS]) if Path(f).is_dir()]
 
 
@@ -499,7 +499,7 @@ def main():
     ps.set_ground_plane_mode("shadow_only")
 
     draw_cube_frame()
-    for folder in fit_folders():                        # fits where you run it, data/fits, data/benchmark
+    for folder in fit_folders():                        # fits where you run it and in data/fits
         scan_fits(folder)
     if args.load:
         S.fit_path = args.load

@@ -1,1 +1,0 @@
-"""Benchmarks comparing the optimizers."""

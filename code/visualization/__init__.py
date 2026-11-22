@@ -1,1 +1,1 @@
-"""Polyscope viewers for the 8- and 16-value cubes."""
+"""Polyscope viewers: the 8-value cube and grids of cubes."""

@@ -26,12 +26,11 @@ DT = torch.float64
 def test_population_field_matches_single_field():
     g = torch.Generator().manual_seed(0)
     X = 2 * torch.rand(200, 3, dtype=DT, generator=g) - 1
-    for n in (8, 16):
-        m = C.Model(n)
-        V = torch.randn(6, n, dtype=DT, generator=g)
-        batch = m.field_batch(V, X)
-        loop = torch.stack([m.field(v, X) for v in V], -1)
-        assert torch.allclose(batch, loop, atol=1e-12), n
+    m = C.Model(8)
+    V = torch.randn(6, 8, dtype=DT, generator=g)
+    batch = m.field_batch(V, X)
+    loop = torch.stack([m.field(v, X) for v in V], -1)
+    assert torch.allclose(batch, loop, atol=1e-12)
 
 
 def test_labels_match_the_target_sign():
@@ -54,7 +53,7 @@ def test_8_values_all_methods_fit_a_flank():
     t = O.builtin_target("sphere flank", n=2000)
     for method in ("logistic", "es", "grpo"):
         cfg = C.ClassifyConfig(method=method, iters=300)
-        v, info = C.fit(t, 8, cfg, verbose=False)
+        v, info = C.fit(t, cfg, verbose=False)
         e = C.report(C.Model(8), v, t, C.Validation.build(C.Sampler(t)), 5)
         assert e["accuracy"] > 0.97, (method, e)
         assert e["rms"] < 0.02, (method, e)
@@ -91,18 +90,6 @@ def test_grpo_improves_the_policy_and_learns_sigma():
     assert pol.sigma < s0
 
 
-def test_16_values_beat_8_on_sphere_cap_without_bubbles():
-    t = O.builtin_target("sphere cap", n=2000)
-    cfg = C.ClassifyConfig(method="logistic", iters=200, starts=3, start_iters=60)
-    v8, _ = C.fit(t, 8, cfg, verbose=False)
-    v16, _ = C.fit(t, 16, cfg, verbose=False)
-    val = C.Validation.build(C.Sampler(t))
-    e8, e16 = C.report(C.Model(8), v8, t, val, 5), C.report(C.Model(16), v16, t, val, 5)
-    assert e16["accuracy"] > e8["accuracy"]
-    assert e16["rms"] < 0.5 * e8["rms"], (e8["rms"], e16["rms"])
-    assert e16["surface_pieces"] == e16["target_pieces"]
-
-
 def test_lattice_sampling_uses_the_same_k3_points():
     t = O.builtin_target("sphere flank", n=1000)
     sm = C.Sampler(t, sampling="lattice", k=7)
@@ -118,7 +105,7 @@ def test_lattice_fit_classifies_the_lattice():
     t = O.builtin_target("sphere flank", n=1500)
     for method in ("logistic", "es", "grpo"):
         cfg = C.ClassifyConfig(method=method, iters=300, sampling="lattice", k=10)
-        v, _ = C.fit(t, 8, cfg, verbose=False)
+        v, _ = C.fit(t, cfg, verbose=False)
         sm = C.make_sampler(t, cfg)
         e = C.report(C.Model(8, t.box), v, t, C.Validation.build(sm), 4, C.Validation.of(sm, *sm.lattice))
         assert e["accuracy_train_lattice"] > 0.98, (method, e)
@@ -128,26 +115,24 @@ def test_lattice_fit_classifies_the_lattice():
 def test_classify_in_a_moved_box():
     box = Box((0.0, -1.0, 0.0), 1.0)
     t = O.builtin_target("sphere cap", n=1500, box=box)
-    v, _ = C.fit(t, 8, C.ClassifyConfig(iters=200), verbose=False)
+    v, _ = C.fit(t, C.ClassifyConfig(iters=200), verbose=False)
     e = C.report(C.Model(8, box), v, t, C.Validation.build(C.Sampler(t)), 4)
     assert e["accuracy"] > 0.94 and e["rms"] < 0.01 * box.size, e
     assert box.contains(C.fitted_mesh(C.Model(8, box), v, 4)[0]).all()
 
 
-def test_saved_files_have_the_viewer_formats():
+def test_saved_file_has_the_viewer_format():
     t = O.builtin_target("sphere flank", n=1000)
-    cfg = C.ClassifyConfig(iters=20, starts=1, start_iters=10)
+    cfg = C.ClassifyConfig(iters=20)
     with tempfile.TemporaryDirectory() as d:
-        for n in (8, 16):
-            v, info = C.fit(t, n, cfg, verbose=False)
-            err = C.report(C.Model(n), v, t, C.Validation.build(C.Sampler(t)), 4)
-            path = os.path.join(d, f"fit{n}.json")
-            C.save(path, n, v.numpy(), t, 4, cfg, err, info, 0)
-            with open(path) as fh:
-                data = json.load(fh)
-            assert len(data["values"]) == n and data["target"] == "sphere flank"
-            assert "rms" in data["final_error"]
-            assert (data.get("type") == "warp16") == (n == 16)
+        v, info = C.fit(t, cfg, verbose=False)
+        err = C.report(C.Model(8), v, t, C.Validation.build(C.Sampler(t)), 4)
+        path = os.path.join(d, "fit.json")
+        C.save(path, v.numpy(), t, 4, cfg, err, info, 0)
+        with open(path) as fh:
+            data = json.load(fh)
+        assert len(data["values"]) == 8 and data["target"] == "sphere flank"
+        assert "rms" in data["final_error"]
 
 
 if __name__ == "__main__":

@@ -1,1 +1,1 @@
-"""Optimizers: surface distance (8 and 16 values) and classification."""
+"""Optimizers for the 8-value cube: surface distance and classification (also used by the grid)."""

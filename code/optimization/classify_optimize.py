@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-classify_optimize.py -- fit a cube (8 values, or 16 with the warp) by inside/outside
-classification of sample points, instead of by distances to the target surface.
+classify_optimize.py -- fit the 8-value cube by inside/outside classification of sample
+points, instead of by distances to the target surface. The same three methods fit
+grids of cubes: see code/grid/grid_optimize.py, which reuses train() from here.
 
 Each sample x gets a label from the analytic target g (negative inside):
     y = +1 if g(x) > 0 (outside),  y = -1 if g(x) < 0 (inside)
@@ -51,13 +52,6 @@ Three ways around that:
         schedule), advantages are z-scores instead of ranks, and the clipped
         ratio lets each group be reused for several steps.
 
-16-value cube: large offsets move a corner far outside the cube, where the second
-trilinear field is extrapolated and can change sign again. That makes small
-closed bubbles near the corners: a tiny volume, so almost free in accuracy, but
-far from the target. --offset-penalty (lambda, default 0.01) subtracts
-lambda * mean(offset^2) from the reward (adds it to the logistic loss). The report
-counts the pieces of the fitted surface so a bubble is visible.
-
 Samples (--sampling):
   random (default)  a fresh batch every step: most points near the target surface
         (surface points moved along the normal by N(0, band^2)), the rest uniform
@@ -74,28 +68,20 @@ The cube can be anywhere (--lo X Y Z, --size S; default [-1, 1]^3). Targets are
 in world space and clipped to the cube; --band, --tau and the "near the surface"
 distance are given for a cube of width 2 and scale with the cube.
 
-16-value cube: the problem is not convex (f is nonlinear in the offsets), so
-stage 1 tries several starts (--starts, each --start-iters steps): the 8-value
-solution of the same method with zero offset, and random starts. The start with
-the best validation reward continues for --iters steps.
-
 Classification fixes which side is inside and the topology, not the distance.
 The report gives both: accuracy (overall and within 0.05 of the surface) and the
-same RMS distance as optimize.py / warp_optimize.py. --chamfer-iters N then
-refines the result with the chamfer optimizer of those modules.
+same RMS distance as optimize.py, and counts the pieces of the fitted surface.
+--chamfer-iters N then refines the result with the chamfer optimizer of optimize.py.
 
 Usage:
-    python code/optimization/classify_optimize.py --target "sphere flank"                         # 8 values, logistic
+    python code/optimization/classify_optimize.py --target "sphere flank"               # logistic
     python code/optimization/classify_optimize.py --target "sphere flank" --method es
-    python code/optimization/classify_optimize.py --cube 16 --target "sphere cap"                 # 16 values, logistic
-    python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --method es --iters 600
-    python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --method grpo
-    python code/optimization/classify_optimize.py --cube 16 --target "torus inner" --chamfer-iters 200
-    python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --method grpo --sampling lattice --k 10
-    python code/optimization/classify_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1     # a smaller cube elsewhere
+    python code/optimization/classify_optimize.py --target "sphere flank" --method grpo
+    python code/optimization/classify_optimize.py --target "sphere flank" --chamfer-iters 200
+    python code/optimization/classify_optimize.py --target "sphere flank" --sampling lattice --k 10
+    python code/optimization/classify_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1   # a smaller cube elsewhere
     python code/optimization/classify_optimize.py --list
-Fits are saved in the same format as optimize.py (8) / warp_optimize.py (16), so
-viewer.py and warp_viewer.py show them in their combo boxes.
+Fits are saved in the same format as optimize.py, so viewer.py shows them in its combo box.
 """
 
 from __future__ import annotations
@@ -116,58 +102,51 @@ import torch
 import torch.nn.functional as Fn
 
 import optimization.optimize as O
-import optimization.warp_optimize as WO
 from core.box import Box, add_box_arguments, box_from_args
-from core.paths import output_path
 from core.cube import Cube
-from core.warpcube import CORNER_DIR, field_world
+from core.geometry import count_pieces  # noqa: F401  (re-exported for callers)
+from core.paths import output_path
 
 DT = torch.float64
 
 
 # ============================================================================
-# The two cubes behind one interface
+# The model
 # ============================================================================
 class Model:
-    """f(values, X) for the 8-value cube or the 16-value warp cube, placed in `box`."""
+    """f(values, X) for the 8-value cube placed in `box`. Grids provide the same
+    interface (grid.grid.GridModel): n, field, field_batch, normalised, field_slice,
+    offset_slice."""
 
-    def __init__(self, n_values: int, box: Box | None = None):
-        assert n_values in (8, 16)
-        self.n = n_values
+    offset_slice = None                     # no offsets / displacements
+
+    def __init__(self, n_values: int = 8, box: Box | None = None):
+        if n_values != 8:
+            raise ValueError("the single cube has 8 values (for more, use a grid: code/grid)")
+        self.n = 8
         self.box = box or Box()
-        self.lo = torch.as_tensor(self.box.lo, dtype=DT)
 
     @property
     def field_slice(self):
-        return slice(0, 8) if self.n == 8 else slice(8, 16)
+        return slice(0, 8)
 
     def field(self, v: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
-        if self.n == 8:
-            return Cube.basis_local(self.box.to_local(X)) @ v
-        return field_world(v, X, self.lo, self.box.size)
+        return Cube.basis_local(self.box.to_local(X)) @ v
 
     def field_batch(self, V: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
-        """f for a population of value vectors V (pop, n) at X (m, 3) -> (m, pop)."""
-        u = self.box.to_local(X)
-        B = Cube.basis_local(u)                                    # (m, 8)
-        if self.n == 8:                                            # linear in v: one matmul
-            return B @ V.T
-        E = torch.as_tensor(CORNER_DIR, dtype=DT)
-        D = (B[None] * V[:, None, :8]) @ E / 2                     # local offsets, half-widths (pop, m, 3)
-        return (Cube.basis_local(u[None] + D) * V[:, None, 8:]).sum(-1).T
+        """f for a population of value vectors V (pop, 8) at X (m, 3) -> (m, pop)."""
+        return Cube.basis_local(self.box.to_local(X)) @ V.T          # linear in v: one matmul
 
     def normalised(self, v: torch.Tensor) -> torch.Tensor:
-        """Field part scaled to norm sqrt(8) (the surface does not depend on it)."""
+        """Values scaled to norm sqrt(8) (the surface does not depend on the scale)."""
         v = v.detach().clone()
-        s = self.field_slice
-        nrm = v[s].norm()
+        nrm = v.norm()
         if nrm > 0:
-            v[s] *= np.sqrt(8) / nrm
+            v *= np.sqrt(8) / nrm
         return v
 
     def evaluate(self, v, target, depth):
-        v = np.asarray(v, float)
-        return O.evaluate(v, target, depth=depth) if self.n == 8 else WO.evaluate(v, target, depth=depth)
+        return O.evaluate(np.asarray(v, float), target, depth=depth)
 
 
 # ============================================================================
@@ -276,7 +255,7 @@ class ClassifyConfig:
     uniform: float = 0.25        # fraction of uniform samples
     weight_decay: float = 1e-3   # logistic: fixes the scale of the field
     tau: float = 0.02            # logistic: temperature, softplus(-y f / tau)
-    offset_penalty: float = 0.01 # 16 values: lambda * mean(offset^2), subtracted from the reward
+    offset_penalty: float = 0.01 # models with displacements (grids): lambda * mean(D^2), subtracted from the reward
     pop: int = 32                # es: perturbations per generation (even)
     sigma: float = 0.1           # es: perturbation size, decays to sigma_final
     sigma_final: float = 0.02
@@ -290,8 +269,6 @@ class ClassifyConfig:
     sampling: str = "random"     # "random" | "lattice"
     k: int = 10                  # lattice: k x k x k points
     lattice_faces: bool = False  # lattice: include the faces (i / (k-1)) instead of cell centres
-    starts: int = 8              # 16-value cube: random starts for stage 1
-    start_iters: int = 100       # 16-value cube: steps per start
     check_every: int = 10
     seed: int = 0
 
@@ -300,11 +277,13 @@ def _cosine(it, iters, a, b):
     return b + (a - b) * 0.5 * (1 + np.cos(np.pi * min(it, iters) / max(iters, 1)))
 
 
-def offset_cost(model: Model, v, lam):
-    """lam * mean(offset^2) for the 16-value cube (0 for 8). v may be (..., n)."""
-    if model.n == 8 or not lam:
+def offset_cost(model, v, lam):
+    """lam * mean(offset^2) over the model's offset / displacement entries (0 for
+    models without any, such as the 8-value cube). v may be (..., n)."""
+    sl = getattr(model, "offset_slice", None)
+    if sl is None or not lam:
         return 0.0
-    return lam * v[..., :8].square().mean(-1)
+    return lam * v[..., sl].square().mean(-1)
 
 
 def logistic_loss(model: Model, v, X, y, cfg: ClassifyConfig):
@@ -434,80 +413,30 @@ def make_sampler(target: O.Target, cfg: ClassifyConfig) -> Sampler:
     return Sampler(target, cfg.band, cfg.uniform, cfg.sampling, cfg.k, cfg.lattice_faces)
 
 
-def fit(target: O.Target, n_values: int, cfg: ClassifyConfig, verbose=True):
-    """Full run. Returns (values, info).
-    The iterate kept (keep-best, choice of start) is the one with the best reward on
-    the training points in lattice mode, on fixed random validation points otherwise."""
+def fit(target: O.Target, cfg: ClassifyConfig, verbose=True):
+    """Full run on the 8-value cube, from zero values. Returns (values, info).
+    The iterate kept is the one with the best reward on the training points in lattice
+    mode, on fixed random validation points otherwise."""
     gen = torch.Generator().manual_seed(cfg.seed)
     sampler = make_sampler(target, cfg)
     val = Validation.of(sampler, *sampler.lattice) if sampler.lattice is not None else Validation.build(sampler)
-    log = 50 if verbose else 0
-    box = target.box
     if verbose:
         print(f"  sampling {sampler.describe()}")
-    if n_values == 8:
-        # logistic: convex, start from zero. es: zero gives reward -1 for every
-        # sample (f = 0 counts as wrong) but the perturbations do not, so it starts.
-        v0 = torch.zeros(8, dtype=DT)
-        if verbose:
-            print(f"  {cfg.method}, 8 values, start: zero values")
-        v, r, hist = train(Model(8, box), sampler, val, v0, cfg.iters, cfg, gen, log)
-        return v, {"start": "zero values", "val_reward": r, "history": hist}
-
-    model = Model(16, box)
-    if verbose:
-        print(f"  stage 1: {cfg.starts} random starts + the 8-value solution, {cfg.start_iters} steps each")
-    v8, _, _ = train(Model(8, box), sampler, val, torch.zeros(8, dtype=DT), max(cfg.start_iters, 1), cfg, gen)
-    cands = [("8-value solution, zero offset", torch.cat([torch.zeros(8, dtype=DT), v8]))]
-    for i in range(cfg.starts):
-        scale = (0.3, 0.6, 1.0)[i % 3]
-        cands.append((f"random start {i} (offset scale {scale})",
-                      torch.cat([scale * torch.randn(8, dtype=DT, generator=gen),
-                                 torch.randn(8, dtype=DT, generator=gen)])))
-    best = (-np.inf, None, None)
-    for name, v0 in cands:
-        v, r, _ = train(model, sampler, val, v0, cfg.start_iters, cfg, gen)
-        if verbose:
-            print(f"    {name:34s} -> val reward {r:+.4f} (acc {(1 + r) / 2:.4f})")
-        if r > best[0]:
-            best = (r, v, name)
-    if verbose:
-        print(f"  stage 2: {cfg.iters} steps from '{best[2]}'")
-    v, r, hist = train(model, sampler, val, best[1], cfg.iters, cfg, gen, log)
-    if best[0] > r:                                       # stage 2 kept the start
-        v, r = best[1], best[0]
-    return v, {"start": best[2], "val_reward": r, "history": hist}
+        print(f"  {cfg.method}, 8 values, start: zero values")
+    # logistic: convex, start from zero. es / grpo: zero gives reward -1 for every
+    # sample (f = 0 counts as wrong) but the perturbations do not, so they start.
+    v, r, hist = train(Model(8, target.box), sampler, val, torch.zeros(8, dtype=DT), cfg.iters, cfg, gen,
+                       50 if verbose else 0)
+    return v, {"start": "zero values", "val_reward": r, "history": hist}
 
 
 # ============================================================================
 # Report, chamfer refinement, save
 # ============================================================================
-def count_pieces(F: np.ndarray) -> int:
-    """Connected pieces of a triangle mesh (label propagation, no scipy)."""
-    F = np.asarray(F, np.int64)
-    if not len(F):
-        return 0
-    lab = np.arange(F.max() + 1)
-    while True:
-        new = lab.copy()
-        np.minimum.at(new, F.ravel(), np.repeat(lab[F].min(1), 3))
-        new = new[new]
-        if np.array_equal(new, lab):
-            return len(np.unique(lab[F.ravel()]))
-        lab = new
-
-
 def fitted_mesh(model: Model, v, depth):
-    v = np.asarray(v, float)
-    if model.n == 8:
-        from core.marching import extract_topology
-        cube = Cube(v, requires_grad=False, **model.box.kw)
-        topo = extract_topology(cube, depth)
-    else:
-        import core.warp_marching as WM
-        from core.warpcube import WarpCube
-        cube = WarpCube(v, requires_grad=False, **model.box.kw)
-        topo = WM.extract_topology(cube, depth)
+    from core.marching import extract_topology
+    cube = Cube(np.asarray(v, float), requires_grad=False, **model.box.kw)
+    topo = extract_topology(cube, depth)
     with torch.no_grad():
         return topo.vertices(cube.values).numpy(), topo.F
 
@@ -530,8 +459,6 @@ def report(model: Model, v, target, val: Validation, depth, train_set: Validatio
     out["cube"] = target.box.to_dict()
     out["surface_pieces"] = count_pieces(fitted_mesh(model, v, depth)[1])
     out["target_pieces"] = count_pieces(target.F)
-    if model.n == 16:
-        out["max_abs_offset"] = float(np.abs(np.asarray(v)[:8]).max())
     return out
 
 
@@ -554,40 +481,32 @@ def print_report(err: dict, title="final classification result"):
         print("  the fitted surface does not cross the cube")
     print(f"  surface pieces                       {err['surface_pieces']}   (target: {err['target_pieces']})"
           + ("   <-- extra pieces (bubbles)" if err['surface_pieces'] > err['target_pieces'] else ""))
-    if "max_abs_offset" in err:
-        print(f"  largest offset value                 {err['max_abs_offset']:.3f}")
     print("=" * 78)
 
 
-def chamfer_refine(n_values, target, v, iters, depth, seed):
-    """Refine with the chamfer optimizer of optimize.py / warp_optimize.py."""
-    if n_values == 8:
-        f = O.Fitter(target, O.FitConfig(depth=depth, iters=iters, seed=seed), values=v)
-    else:
-        f = WO.WarpFitter(target, WO.FitConfig(depth=depth, iters=iters, seed=seed), values=v)
+def chamfer_refine(target, v, iters, depth, seed):
+    """Refine with the chamfer optimizer of optimize.py."""
+    f = O.Fitter(target, O.FitConfig(depth=depth, iters=iters, seed=seed), values=v)
     f.run(iters, log_every=50)
     return f.values
 
 
-def save(path, n_values, v, target, depth, cfg: ClassifyConfig, err, info, chamfer_iters):
+def save(path, v, target, depth, cfg: ClassifyConfig, err, info, chamfer_iters):
     v = np.asarray(v, float)
     data = {"values": v.tolist(), "depth": depth, "target": target.name,
             "optimizer": "classify", "method": cfg.method, "iterations": cfg.iters,
             "chamfer_iters": chamfer_iters, "start": info["start"],
             "config": {k: getattr(cfg, k) for k in cfg.__dataclass_fields__},
             "final_error": err, **target.box.to_dict()}
-    if n_values == 16:
-        data.update({"type": "warp16", "offset": v[:8].tolist(), "field": v[8:].tolist()})
     with open(path, "w") as fh:
         json.dump(data, fh, indent=2)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cube", type=int, default=8, choices=[8, 16], help="8 values, or 16 (warp cube)")
     ap.add_argument("--method", default="logistic", choices=["logistic", "es", "grpo"])
     ap.add_argument("--target", default="sphere flank", choices=["trilinear", *O.FUNCTIONS])
-    ap.add_argument("--iters", type=int, default=400, help="steps (generations for es); stage 2 for --cube 16")
+    ap.add_argument("--iters", type=int, default=400, help="steps (generations for es and grpo)")
     ap.add_argument("--lr", type=float, default=0.05)
     ap.add_argument("--batch", type=int, default=4000, help="labelled samples per step")
     ap.add_argument("--sampling", default="random", choices=["random", "lattice"],
@@ -600,8 +519,6 @@ def main():
     ap.add_argument("--uniform", type=float, default=0.25, help="random: fraction of uniform samples")
     ap.add_argument("--weight-decay", type=float, default=1e-3, help="logistic only")
     ap.add_argument("--tau", type=float, default=0.02, help="logistic only: temperature (soft boundary width)")
-    ap.add_argument("--offset-penalty", type=float, default=0.01,
-                    help="--cube 16 only: lambda * mean(offset^2) against corner bubbles (0 = off)")
     ap.add_argument("--pop", type=int, default=32, help="es only: perturbations per generation")
     ap.add_argument("--sigma", type=float, default=0.1, help="es only: initial perturbation size")
     ap.add_argument("--group", type=int, default=32, help="grpo only: group size G")
@@ -611,13 +528,11 @@ def main():
     ap.add_argument("--ref-every", type=int, default=10, help="grpo only: refresh the reference every k iterations")
     ap.add_argument("--grpo-sigma", type=float, default=0.2, help="grpo only: initial policy std (then learned)")
     ap.add_argument("--grpo-lr", type=float, default=0.02, help="grpo only: Adam learning rate")
-    ap.add_argument("--starts", type=int, default=8, help="--cube 16 only: random starts")
-    ap.add_argument("--start-iters", type=int, default=100, help="--cube 16 only: steps per start")
     ap.add_argument("--chamfer-iters", type=int, default=0, help="then refine with the chamfer optimizer")
     ap.add_argument("--depth", type=int, default=5)
     ap.add_argument("--seed", type=int, default=0)
     add_box_arguments(ap)
-    ap.add_argument("--out", help="output fit file (default data/fits/classify_fit.json, or classify_warp_fit.json for 16)")
+    ap.add_argument("--out", help="output fit file (default data/fits/classify_fit.json)")
     ap.add_argument("--list", action="store_true", help="list targets")
     args = ap.parse_args()
 
@@ -625,18 +540,17 @@ def main():
         print("targets:", "trilinear,", ", ".join(O.FUNCTIONS))
         return
     cfg = ClassifyConfig(method=args.method, iters=args.iters, lr=args.lr, batch=args.batch,
-                         band=args.band, uniform=args.uniform, weight_decay=args.weight_decay, tau=args.tau, offset_penalty=args.offset_penalty,
-                         pop=args.pop + args.pop % 2, sigma=args.sigma, starts=args.starts,
-                         start_iters=args.start_iters, seed=args.seed,
+                         band=args.band, uniform=args.uniform, weight_decay=args.weight_decay, tau=args.tau,
+                         pop=args.pop + args.pop % 2, sigma=args.sigma, seed=args.seed,
                          group=args.group, grpo_epochs=args.grpo_epochs, clip=args.clip, kl_coef=args.kl_coef,
                          ref_every=args.ref_every, grpo_sigma=args.grpo_sigma, grpo_lr=args.grpo_lr,
                          sampling=args.sampling, k=args.k, lattice_faces=args.lattice_faces)
-    out = args.out or output_path("classify_fit.json" if args.cube == 8 else "classify_warp_fit.json")
+    out = args.out or output_path("classify_fit.json")
     target = O.builtin_target(args.target, box=box_from_args(args))
-    print(f"target '{target.name}', {args.cube}-value cube in {target.box}, method {args.method}")
+    print(f"target '{target.name}', 8-value cube in {target.box}, method {args.method}")
     t0 = time.time()
-    v, info = fit(target, args.cube, cfg)
-    model = Model(args.cube, target.box)
+    v, info = fit(target, cfg)
+    model = Model(8, target.box)
     sampler = make_sampler(target, cfg)
     val = Validation.build(sampler)
     lat = Validation.of(sampler, *sampler.lattice) if sampler.lattice is not None else None
@@ -645,15 +559,13 @@ def main():
     print_report(err)
     if args.chamfer_iters > 0:
         print(f"\nchamfer refinement, {args.chamfer_iters} Adam steps")
-        v = model.normalised(torch.as_tensor(chamfer_refine(args.cube, target, v, args.chamfer_iters,
-                                                            args.depth, args.seed)))
+        v = model.normalised(torch.as_tensor(chamfer_refine(target, v, args.chamfer_iters, args.depth, args.seed)))
         err2 = report(model, v, target, val, args.depth, lat)
         err2["before_chamfer"] = err
         err = err2
         print_report(err, "after chamfer refinement")
-    save(out, args.cube, v.numpy(), target, args.depth, cfg, err, info, args.chamfer_iters)
-    viewer = "code/visualization/" + ("viewer.py" if args.cube == 8 else "warp_viewer.py")
-    print(f"saved {out}   (view: python {viewer} --load {out})")
+    save(out, v.numpy(), target, args.depth, cfg, err, info, args.chamfer_iters)
+    print(f"saved {out}   (view: python code/visualization/viewer.py --load {out})")
 
 
 if __name__ == "__main__":

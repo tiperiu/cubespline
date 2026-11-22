@@ -1,23 +1,21 @@
 """
 box.py -- where a cube sits in space: the axis-aligned cube [lo, lo + size]^3.
 
-Every cube (Cube, WarpCube), target, optimizer run and saved fit carries a Box.
+Every cube (Cube), target, optimizer run and saved fit carries a Box.
 Box() is [-1, 1]^3 (lo = (-1, -1, -1), size 2), the cube used so far. Files saved
 before boxes existed have no "lo"/"size" keys and load as Box().
 
 Units
     Corner values are dimensionless: values fitted in one box give the same
     shape, moved and scaled, in any other box. Lengths that belong to the fit
-    rather than the world are relative to the cube:
-      * warp offsets (warpcube.py) are in half-widths: corner n moves by
-        c1[n] * size/2 along its diagonal (for the default cube, world units as before);
-      * the --band, --tau and near-surface lengths of classify_optimize.py are
-        given for a cube of width 2 and scale with the cube (Box.scale).
+    rather than the world are relative to the cube: the --band, --tau and
+    near-surface lengths of classify_optimize.py are given for a cube of width 2
+    and scale with the cube (Box.scale).
     Distances to the target (RMS, max) are reported in world units and as a
     percentage of the cube width. Targets live in world space; a target is
     clipped to the box it is fitted in.
 
-Preparing for grids of cubes (cells sharing corners, not implemented yet)
+Grids of cubes (implemented in code/grid; these helpers describe the same layout)
     * Box.grid_cell(origin, cell_size, ijk) is the box of cell ijk of a regular
       grid that starts at `origin`.
     * corner_vertex_ids(ijk, dims) maps a cell's 8 corners (local order
@@ -70,7 +68,7 @@ class Box:
 
     @property
     def kw(self) -> dict:
-        """Keyword arguments for Cube / WarpCube:  Cube(values, **box.kw)."""
+        """Keyword arguments for Cube:  Cube(values, **box.kw)."""
         return {"lo": list(self.lo), "size": self.size}
 
     def scale(self, length: float) -> float:

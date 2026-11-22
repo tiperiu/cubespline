@@ -1,42 +1,49 @@
 # cubespline
 
-A single cube with 8 corner values. Inside the cube the field is the trilinear
-interpolation of the values; its level set `f = level` (default 0) is a surface.
-This repo extracts that surface with subdivided marching cubes, views it with
-Polyscope, and optimizes the 8 values so the surface matches a target.
+A cube with 8 corner values, and grids of such cubes. Inside a cube the field is the
+trilinear interpolation of the values; its level set `f = level` (default 0) is a
+surface. This repo extracts that surface with subdivided marching cubes, views it
+with Polyscope, and optimizes the values so the surface matches a target: one cube
+(`code/core`, `code/optimization`), or a whole grid of cubes that share their corner
+values (`code/grid`, see [Grids of cubes](#grids-of-cubes-codegrid)).
 
 ## Project layout
 
 ```
 cubespline/
-  README.md  requirements.txt
+  README.md  CLAUDE.md  requirements.txt
   code/
-    core/           cube representations, meshing, placement
-    optimization/   the optimizers
+    core/           the single cube: representation, meshing, placement; mesh geometry
+    optimization/   the single-cube optimizers
+    grid/           grids of cubes: models, meshing, targets, optimizer, examples script
     visualization/  the viewers
-    benchmark/      comparison of the optimizers
     tests/          tests
+  examples/
+    functions/      example implicit functions g(x): spheres, ellipsoids, tori
+    point_clouds/   the same shapes as point clouds (.xyz), plus two harder variants
   data/
-    fits/           fit files written by the optimizers (default --out)
-    benchmark/      benchmark results, saved fits, overview images
-  docs/             documents
+    fits/           fit files of the single-cube optimizers (default --out)
+    fits/grid/      fit files of the grid optimizer
 ```
 
 | file | what it does |
 |---|---|
 | `code/core/cube.py` | `Cube` (PyTorch `nn.Module`): 8 values as a parameter, `evaluate`, `basis`, `gradient`, `basis_gradient`, presets |
 | `code/core/marching.py` | octree subdivision with exact pruning + marching cubes → `V` (positions), `F` (connectivity); `mesh_from_grid` for any sampled function |
-| `code/core/warpcube.py` | `WarpCube`: 16 values, 8 offsets + 8 field values (second version, see below) |
-| `code/core/warp_marching.py` | subdivided marching cubes for the 16-value cube |
 | `code/core/box.py` | `Box`: where a cube sits (`lo`, `size`), lattices, `--lo/--size` options, grid helpers (`grid_cell`, `corner_vertex_ids`) |
-| `code/core/paths.py` | the project folders (`data/fits`, `data/benchmark`) used for default outputs and by the viewers |
+| `code/core/geometry.py` | mesh helpers: connected pieces, closest point on a triangle, exact point-to-mesh distances |
+| `code/core/paths.py` | the project folders (`data/fits`, `data/fits/grid`, `examples`) used for default outputs and by the viewers |
 | `code/optimization/optimize.py` | targets, and the fit of the 8 values to a target surface (function or mesh); live view with `--view` |
-| `code/optimization/warp_optimize.py` | fit the 16 values to a target |
-| `code/optimization/classify_optimize.py` | fit either cube by inside/outside classification: logistic loss + Adam, evolution strategies, or GRPO (reward only) |
-| `code/visualization/viewer.py` | Polyscope viewer: cube, corner values, mesh, sliders for the values / depth / level; `--load fit.json` |
-| `code/visualization/warp_viewer.py` | viewer with 16 sliders, the warped cube and fit loading |
-| `code/benchmark/benchmark_warp.py` | compares every 16-value optimizer (time, own loss, common chamfer distance) |
-| `code/tests/test_*.py` | tests: `test_cubespline`, `test_optimize`, `test_warp`, `test_classify`, `test_box` |
+| `code/optimization/classify_optimize.py` | fit the cube by inside/outside classification: logistic loss + Adam, evolution strategies, or GRPO (reward only); the grid optimizer reuses it |
+| `code/grid/grid.py` | `Grid` (cells, vertex ids, interpolation) and `GridModel`: `scalar` (a value per vertex) or `warp` (a value and a 3D displacement per vertex) |
+| `code/grid/grid_marching.py` | marching cubes over the whole grid, differentiable vertices, watertightness check |
+| `code/grid/targets.py` | grid targets: function files `g(X)` and point clouds (.xyz, .ply, .obj, …), normal estimation, inside/outside labels, distances |
+| `code/grid/grid_optimize.py` | fit a grid to a target: chamfer (closed form → Sampson → chamfer through marching cubes), logistic, ES, GRPO |
+| `code/grid/fit_examples.py` | fit every example, save the fits and print a results table |
+| `code/grid/make_examples.py` | write the example point clouds from the example functions |
+| `code/visualization/viewer.py` | Polyscope viewer for one cube: cube, corner values, mesh, sliders for the values / depth / level; `--load fit.json` |
+| `code/visualization/grid_viewer.py` | Polyscope viewer for grids: examples, fits, cells, displacements; fit from the window |
+| `code/tests/test_*.py` | tests: `test_cubespline`, `test_optimize`, `test_classify`, `test_box` (one cube), `test_grid` (grids) |
 
 **Running.** Run every script from anywhere, e.g. `python code/optimization/optimize.py`
 from the project folder: each script puts `code/` on the Python path itself, and
@@ -44,10 +51,10 @@ inside the code the modules import each other as packages (`from core.cube impor
 Cube`). In PyCharm, optionally mark `code/` as a Sources Root so it resolves the
 imports in the editor.
 
-**Data.** Unless `--out` says otherwise, the optimizers write their fit files to
-`data/fits/` and the benchmark writes to `data/benchmark/`. The viewers list the fit
-files of the folder they are started from, `data/fits` and `data/benchmark`, and
-`--load NAME` also finds a file by name in those two folders.
+**Data.** Unless `--out` says otherwise, the single-cube optimizers write their fit
+files to `data/fits/` and the grid optimizer to `data/fits/grid/`. The viewers list
+the fit files of the folder they are started from and of those folders, and
+`--load NAME` also finds a file by name there.
 
 ## Setup
 
@@ -55,8 +62,9 @@ files of the folder they are started from, `data/fits` and `data/benchmark`, and
 cd cubespline
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest code/tests -q                         # all tests (39), about 1.5 min
+python -m pytest code/tests -q                         # all tests (49), about 1 min
 python code/tests/test_cubespline.py                   # or one file at a time
+python code/tests/test_grid.py                         # only the grid tests (18), about 20 s
 ```
 
 ## Use
@@ -123,8 +131,8 @@ python code/optimization/optimize.py --mesh my.obj --loss chamfer=1 --loss norma
 python code/visualization/viewer.py --load fit.json                   # inspect the result
 ```
 
-In the viewer, every `*.json` fit in the folder you run it from, in `data/fits` and in
-`data/benchmark` appears in the **preset / fit** combo box as `fit: <file> (<target>)`. Selecting one sets its values
+In the viewer, every `*.json` fit in the folder you run it from and in `data/fits`
+appears in the **preset / fit** combo box as `fit: <file> (<target>)`. Selecting one sets its values
 and depth and draws its target surface in transparent orange. **Load fit** opens
 any other fit file by path; **Rescan \*.json** picks up fits written while the viewer
 is open.
@@ -239,17 +247,17 @@ monotone piece, so cells must be small enough, or placed so that no apex or cres
 falls strictly inside one.
 
 The natural next step for curved targets is several cubes sharing corner values,
-a grid of trilinear cells (the "cube spline"). The pieces here, the mesher, the
-differentiable vertices and the loss registry, carry over unchanged to that setting.
+a grid of trilinear cells (the "cube spline"). That is `code/grid`, described
+[below](#grids-of-cubes-codegrid). It reuses the mesher's case table, the
+differentiable vertices and the classification optimizers.
 
 ## Cube position and size (`box.py`)
 
 Every cube is an axis-aligned cube `[lo, lo + size]³`, by default `[-1, 1]³`. All
-the optimizers and both viewers take `--lo X Y Z` and `--size S`:
+the single-cube optimizers and the viewer take `--lo X Y Z` and `--size S`:
 
 ```bash
 python code/optimization/optimize.py --target "sphere cap" --lo 0 -1 0 --size 1        # a corner octant of the default cube
-python code/optimization/warp_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1
 python code/optimization/classify_optimize.py --target "sphere cap" --lo 0 -1 0 --size 1
 python code/visualization/viewer.py --preset saddle --lo 2 0 0 --size 0.5
 ```
@@ -259,134 +267,24 @@ python code/visualization/viewer.py --preset saddle --lo 2 0 0 --size 0.5
   different part of them, or nothing. Then you get the error "no surface inside
   the cube".
 * **Values are dimensionless.** The same values give the same shape, moved and
-  scaled, in any cube. The 16-value offsets are measured in half-widths: corner n
-  moves by `c1[n] · size/2` along its diagonal. For the default cube this is the
-  world unit used before, so earlier fits and presets are unchanged.
+  scaled, in any cube.
 * **Saved fits** store `"lo"` and `"size"`. Files without them load as the
   default cube. The viewers move the cube, the target and the camera to each
   fit's box. Presets use `--lo/--size`. The current box is shown under the combo
   box.
 * **Errors** (RMS, max) are in world units, and as a percentage of the cube width.
 
-Example: the corner octant `--lo 0 -1 0 --size 1` of the sphere cap. The 8-value
-fit reaches RMS 1.8e-3 and the 16-value fit 1.1e-3, both well under 1 % of the
-cube width. That octant contains only a flank-like part of the cap.
+Example: the corner octant `--lo 0 -1 0 --size 1` of the sphere cap. The fit
+reaches RMS 1.8e-3, well under 1 % of the cube width. That octant contains only a
+flank-like part of the cap.
 
-### Preparing for grids of cubes
+`Box.grid_cell(origin, h, ijk)` is cell `ijk` of a regular grid, and
+`corner_vertex_ids(ijk, dims)` gives the ids of its 8 corners (order `n = i + 2j + 4k`)
+in the grid's `(nx+1)(ny+1)(nz+1)` vertex array. Neighbouring cells that share their
+corner values meet without a seam (`test_box.py` checks that the field agrees
+exactly on the common face). `code/grid` uses the same numbering.
 
-Not implemented yet. The pieces in place:
-
-* `Box.grid_cell(origin, h, ijk)` is cell `ijk` of a regular grid.
-  `corner_vertex_ids(ijk, dims)` gives the ids of its 8 corners (same order
-  `n = i + 2j + 4k`) in the grid's `(nx+1)(ny+1)(nz+1)` vertex array. A grid
-  stores one value per grid vertex, and a cell uses `values[corner_vertex_ids(ijk, dims)]`.
-* The 8-value mesh topology stores each mesh vertex's lattice edge `(a_ijk, b_ijk)`
-  at resolution `2^depth`. In a grid, `ijk · 2^depth + a_ijk` gives a global key,
-  which joins the meshes of neighbouring cells on their common face.
-* **8 values:** neighbouring cells sharing their corner values meet without a
-  seam (`test_box.py` checks the field agrees exactly on the common face).
-* **16 values:** not yet. Corner offsets move along the cell's own diagonal,
-  `e_n = (2i−1, 2j−1, 2k−1)`, which points outward from that cell. A grid
-  vertex shared by two cells is therefore moved in different directions by
-  each, so the field jumps across the face, even with shared offsets and
-  values (by about 0.09 in a random test). Making 16-value grids continuous
-  needs a choice of offset rule first. For example, a 3-vector displacement
-  per grid vertex instead of a scalar along each cell's diagonal, with the
-  displacement kept tangential on the faces.
-
-## Second version: the 16-value cube (`warpcube.py`)
-
-```
-values = [ offset c1 (8) | field c2 (8) ]
-x'   = x + D(x),   D(x) = (size/2) Σ_n w_n(x) c1[n] e_n      e_n = corner n's diagonal direction (±1, ±1, ±1)
-f(x) = T2(x')      T2 = trilinear interpolation of c2 (extended outside the cube if x' leaves it)
-```
-
-Each offset value moves its corner along the cube diagonal, outward if positive.
-Trilinear interpolation of the moved corners gives the new point x'; the 8 field
-values are then interpolated at x'. With all offsets 0 this is exactly the 8-value
-cube; the tests check that the mesher gives identical meshes then. The offset rule
-is the single function `offset_local` in `warpcube.py`.
-
-```bash
-python code/optimization/warp_optimize.py --target "sphere cap"              # writes data/fits/warp_fit.json
-python code/optimization/warp_optimize.py --target "sphere cap" --start-iters 200 --refine-iters 500
-python code/optimization/warp_optimize.py --target "sphere cap" --no-refine  # stage 1 only
-python code/optimization/warp_optimize.py --target "torus inner" --out warp_torus_inner.json
-python code/optimization/warp_optimize.py --target "sphere cap" --view       # live window
-python code/visualization/warp_viewer.py                                      # 16 sliders; fits in the combo box
-python code/tests/test_warp.py
-```
-
-**Mesher (`warp_marching.py`).** f is no longer trilinear, so three parts change:
-
-* *Pruning* uses a rigorous bound. On a sub-cube each component of x' is trilinear,
-  so x' stays in the box spanned by its 8 corner values. T2 is trilinear, so its
-  range over that box is spanned by the box's 8 corners. If that range excludes the
-  level, the sub-cube is empty. The bound never discards surface (tested).
-* *Vertices* are found by bisection along each lattice edge, in float64, to round-off.
-  |f(V)| ≤ 1e-14 in the tests.
-* *Gradients*: after bisection, `t = t* − f/f_t`, with `f_t` detached, gives the
-  implicit-function-theorem derivative, so the vertices are differentiable in all
-  16 values (gradcheck).
-
-As in any marching cubes, a surface piece entirely inside one leaf cell with all
-corners on one side is not captured; the depth controls that.
-
-**Optimizer (`warp_optimize.py`).** Good fits need large offsets (values of ±1–2),
-which gradient descent from zero offset does not reach. So the start is a
-multi-start, mesh-free fit: from the 8-value solution and 16 random starts, minimise
-the point-to-surface (Sampson) distance with L-BFGS, and keep the best by true
-distance. Then the same chamfer refinement through marching cubes runs as before,
-keeping the best iterate. `--init regular` starts at the 8-value fit only.
-
-Iteration counts, per stage:
-
-| option | stage | default |
-|---|---|---|
-| `--starts K` | 1: number of random starts (plus the 8-value fit) | 16 |
-| `--start-iters N` | 1: L-BFGS iterations per start | 100 |
-| `--refine-iters M` | 2: Adam steps of the chamfer refinement (`--iters` is an alias) | 300 |
-| `--no-refine` | skip stage 2 (same as `--refine-iters 0`) | |
-
-Losses: `chamfer`, `algebraic`, `normal`, and `offset` (keeps offsets small). The final error
-report and the `final_error` block in the fit file have the same format as `optimize.py`.
-
-**Why it helps.** The 8-value cube's level set is monotone in every axis-aligned
-slice (a Möbius function), so it cannot have a bump inside the cube. The 16-value
-level set is T2(x + D(x)): products such as x'·y' with y' depending on x create x²
-terms, and the field can bend.
-
-### Results: 16-value vs 8-value cube
-
-Default settings (depth 5, 300 iterations, 16 random starts), cube [-1, 1]³ (width 2).
-RMS = true distance to the target, both directions:
-
-| target | 8-value RMS | 16-value RMS | 16-value max | gain | largest offset |
-|---|---|---|---|---|---|
-| sphere flank | 8.4e-03 | 2.4e-03 | 0.011 | 3.5× | 2.17 |
-| large sphere flank | 3.5e-03 | 7.2e-04 | 0.003 | 4.9× | 1.46 |
-| torus outer flank | 8.5e-03 | 3.0e-03 | 0.013 | 2.8× | 0.55 |
-| torus inner flank (saddle) | 6.7e-03 | 3.2e-03 | 0.018 | 2.1× | 0.92 |
-| **sphere cap** (apex inside) | 8.7e-02 | **5.8e-03** | 0.031 | **15×** | 1.27 |
-| large sphere cap | 9.4e-03 | 3.0e-03 | 0.027 | 3.1× | 1.20 |
-| **torus outer** (crest inside) | 9.8e-02 | **1.2e-02** | 0.056 | **8.6×** | 1.19 |
-| **torus inner** (saddle, crest inside) | 1.3e-01 | **1.2e-02** | 0.069 | **11×** | 2.28 |
-
-Each run takes 40–60 s on a laptop CPU.
-
-* On the flanks, which the 8-value cube already handles, the extra 8 values still
-  reduce the error 2–5×.
-* On patches with an apex or crest inside the cube, which the 8-value cube cannot
-  bend into, the 16-value cube is 9–15× better. The cap and the centred tori come
-  down from 9–13 % of the cube width to about 0.6 %.
-* The good fits use large offsets (±1–2, on a cube of width 2): the warp moves
-  points well outside the cube before the field is evaluated. The multi-start
-  matters; from zero offset alone, the refinement stays near the 8-value solution.
-* The two "(fitted)" presets in `warp_viewer.py` are the sphere-cap and torus-inner
-  results from this table.
-
-## Third optimizer: inside/outside classification (`classify_optimize.py`)
+## Second optimizer: inside/outside classification (`classify_optimize.py`)
 
 Instead of distances to the target surface, points are sampled in the cube and
 labelled by the analytic target g: `y = +1` outside (g > 0), `y = -1` inside. The
@@ -396,8 +294,7 @@ cube is right at x when `sign(f(x)) == y`. The reward is
 
 R is a step function of the values. A small change almost never flips a sample,
 so its gradient is zero almost everywhere and Adam cannot use it directly. There
-are three ways around that, and all work with the 8-value cube (`--cube 8`,
-default) and the 16-value cube (`--cube 16`):
+are three ways around that:
 
 | `--method` | what it optimizes | how |
 |---|---|---|
@@ -420,25 +317,19 @@ Samples (`--sampling`):
   report also gives the accuracy on independent random points, to show how well
   the lattice fit generalises.
 
-16-value cube: the problem is not convex, so stage 1 runs `--starts` random
-starts plus the 8-value solution (zero offset) for `--start-iters` steps each.
-The best one continues for `--iters` steps.
-
 ```bash
-python code/optimization/classify_optimize.py --target "sphere flank"                       # 8 values, logistic
+python code/optimization/classify_optimize.py --target "sphere flank"                      # logistic
 python code/optimization/classify_optimize.py --target "sphere flank" --method es
-python code/optimization/classify_optimize.py --cube 16 --target "sphere cap"               # 16 values
-python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --method es --iters 600
-python code/optimization/classify_optimize.py --cube 16 --target "torus inner" --method grpo
-python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --chamfer-iters 200   # then chamfer refinement
-python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --sampling lattice           # 10x10x10 = 1000 points
-python code/optimization/classify_optimize.py --cube 16 --target "sphere cap" --sampling lattice --k 20 --lattice-faces
-python code/visualization/warp_viewer.py --load classify_warp_fit.json                       # view (8-value: viewer.py --load classify_fit.json)
+python code/optimization/classify_optimize.py --target "torus inner flank" --method grpo
+python code/optimization/classify_optimize.py --target "sphere cap" --chamfer-iters 200      # then chamfer refinement
+python code/optimization/classify_optimize.py --target "sphere flank" --sampling lattice     # 10x10x10 = 1000 points
+python code/optimization/classify_optimize.py --target "sphere flank" --sampling lattice --k 20 --lattice-faces
+python code/visualization/viewer.py --load classify_fit.json                                 # view the result
 ```
 
 | option | default | meaning |
 |---|---|---|
-| `--iters` | 400 | steps (ES: generations); stage 2 for `--cube 16` |
+| `--iters` | 400 | steps (ES: generations) |
 | `--sampling` | random | `random` (fresh batches) or `lattice` (fixed k³ points) |
 | `--k`, `--lattice-faces` | 10, off | lattice: points per axis; include the faces, edges and corners |
 | `--batch` | 4000 | random: labelled samples per step |
@@ -449,147 +340,310 @@ python code/visualization/warp_viewer.py --load classify_warp_fit.json          
 | `--group`, `--grpo-epochs`, `--clip` | 32, 4, 0.2 | GRPO: group size G, Adam steps per group, ratio clipping ε |
 | `--grpo-sigma`, `--grpo-lr` | 0.2, 0.02 | GRPO: initial policy std (then learned), learning rate for μ and log σ |
 | `--kl-coef`, `--ref-every` | 0, 10 | GRPO: β of KL(π‖π_ref), and how often π_ref is refreshed |
-| `--starts`, `--start-iters` | 8, 100 | `--cube 16` only: stage 1 |
-| `--offset-penalty` | 0.01 | `--cube 16` only: λ · mean(offset²), against corner bubbles (see below) |
-| `--chamfer-iters` | 0 | refine afterwards with the chamfer optimizer of `optimize.py` / `warp_optimize.py` |
+| `--chamfer-iters` | 0 | refine afterwards with the chamfer optimizer of `optimize.py` |
 
 The report gives the validation accuracy (overall, and within 0.05 of the
 surface), the same RMS distance as the other optimizers, and the number of
 pieces of the fitted surface.
 
-**Corner bubbles.** Accuracy measures volume, not distance. Without the offset
-penalty, ES on the 16-value cube reached 99.3 % accuracy on the sphere flank but
-RMS 0.14. A corner offset of 3.9 sends the points near that corner far outside the
-cube. The second trilinear field is extrapolated there and changes sign again,
-which creates two small closed bubbles. They hold 0.17 % of the volume, so they
-cost almost nothing in accuracy, and the chamfer refinement cannot remove a
-detached piece. The default penalty λ = 0.01 removes them (RMS 3.2e-3), and the
-"surface pieces" line in the report flags any that remain.
-
 **GRPO settings.** The KL term is off by default. In LLM training it keeps the
 model close to the pretrained one. Here the policy has to travel far from its
-start, and β = 0.04 (the DeepSeek value) roughly doubled the error on the caps.
-Without it, the reference policy plays no role. The learned σ shrinks by itself
-(0.2 → about 0.003 over a run), which replaces the fixed σ schedule of ES.
-Starting σ at 0.1 instead of 0.2 let it narrow too early on torus inner (RMS
-8e-2 vs 2e-2).
+start, and β = 0.04 (the DeepSeek value) made the fits worse. Without it, the
+reference policy plays no role. The learned σ shrinks by itself (0.2 → about
+0.003 over a run), which replaces the fixed σ schedule of ES.
 
-### Results (default settings, about 1–2 s for 8 values, 5 s logistic / 11–14 s ES and GRPO for 16)
+### Results (default settings, about 1–2 s per run)
 
 RMS distance to the target (cube width 2); the last column is the chamfer
-optimizers (`optimize.py` / `warp_optimize.py`) from the tables above.
+optimizer (`optimize.py`) from the tables above.
 
-| target | 8 logistic | 8 ES | 8 GRPO | 16 logistic | 16 ES | 16 GRPO | chamfer 8 / 16 |
-|---|---|---|---|---|---|---|---|
-| sphere flank | 8.9e-3 | 9.5e-3 | 9.5e-3 | 5.6e-3 | 3.2e-3 | 7.7e-3 | 8.4e-3 / 2.4e-3 |
-| large sphere flank | 3.7e-3 | 3.8e-3 | 3.7e-3 | 3.1e-3 | 3.5e-3 | 2.8e-3 | 3.5e-3 / 7.2e-4 |
-| torus outer flank | 8.8e-3 | 9.0e-3 | 9.3e-3 | 4.0e-3 | 7.0e-3 | 6.8e-3 | 8.5e-3 / 3.0e-3 |
-| torus inner flank | 7.0e-3 | 6.7e-3 | 7.4e-3 | 4.1e-3 | 6.9e-3 | 5.5e-3 | 6.7e-3 / 3.2e-3 |
-| sphere cap | 8.8e-2 | 1.0e-1 | 1.1e-1 | 1.6e-2 | 1.8e-2 | 2.4e-2 | 8.7e-2 / 5.8e-3 |
-| large sphere cap | 1.1e-2 | 1.0e-2 | 9.8e-3 | 6.7e-3 | 8.6e-3 | 8.4e-3 | 9.4e-3 / 3.0e-3 |
-| torus outer | 1.1e-1 | 1.2e-1 | 1.1e-1 | 3.8e-2 | 4.2e-2 | 4.5e-2 | 9.8e-2 / 1.2e-2 |
-| torus inner | 1.3e-1 | 1.5e-1 | 1.4e-1 | 6.0e-2 | 4.7e-2 | 2.0e-2 | 1.3e-1 / 1.2e-2 |
+| target | logistic | ES | GRPO | chamfer |
+|---|---|---|---|---|
+| sphere flank | 8.9e-3 | 9.5e-3 | 9.5e-3 | 8.4e-3 |
+| large sphere flank | 3.7e-3 | 3.8e-3 | 3.7e-3 | 3.5e-3 |
+| torus outer flank | 8.8e-3 | 9.0e-3 | 9.3e-3 | 8.5e-3 |
+| torus inner flank | 7.0e-3 | 6.7e-3 | 7.4e-3 | 6.7e-3 |
+| sphere cap | 8.8e-2 | 1.0e-1 | 1.1e-1 | 8.7e-2 |
+| large sphere cap | 1.1e-2 | 1.0e-2 | 9.8e-3 | 9.4e-3 |
+| torus outer | 1.1e-1 | 1.2e-1 | 1.1e-1 | 9.8e-2 |
+| torus inner | 1.3e-1 | 1.5e-1 | 1.4e-1 | 1.3e-1 |
 
-* 8 values: both methods match the chamfer optimizer starting from zero values,
-  with no closed-form start and no mesh.
-* 16 values: classification gets most of the gain over 8 values, but stays 1.5–4×
-  behind the chamfer optimizer on caps and tori. It optimizes sign agreement over
-  a band of width ~0.1, not the exact position of the surface.
-  `--chamfer-iters` helps a little (sphere cap 1.6e-2 → 1.4e-2); the chamfer
-  optimizer's own multi-start finds a better basin.
-* ES and GRPO need no derivatives and do about as well as logistic, at 2–3× the
-  time for 16 values. No single method wins everywhere: GRPO is best of the
-  classifiers on torus inner, ES on the sphere flank, logistic on the caps.
+* All three methods match the chamfer optimizer, starting from zero values, with
+  no closed-form start and no mesh.
+* ES and GRPO need no derivatives and do about as well as logistic.
 
 ### Lattice sampling (`--sampling lattice`)
 
 RMS distance to the target, with random sampling for comparison (from the table
 above). The lattice is 10³ = 1000 or 20³ = 8000 cell-centre points.
 
-| target | cube | logistic k=10 / 20 | ES k=10 / 20 | GRPO k=10 / 20 | random (logistic / ES / GRPO) |
-|---|---|---|---|---|---|
-| sphere flank | 8 | 1.5e-2 / 1.1e-2 | 1.1e-2 / 9.7e-3 | 1.0e-2 / 1.1e-2 | 8.9e-3 / 9.5e-3 / 9.5e-3 |
-| sphere flank | 16 | 1.0e-2 / 6.8e-3 | 8.9e-3 / 8.5e-3 | 1.1e-2 / 8.1e-3 | 5.6e-3 / 3.2e-3 / 7.7e-3 |
-| sphere cap | 16 | 1.8e-2 / 3.1e-2 | 2.2e-2 / 1.5e-2 | 4.7e-2 / 2.1e-2 | 1.6e-2 / 1.8e-2 / 2.4e-2 |
-| torus inner | 16 | 5.3e-2 / 5.5e-2 | 7.5e-2 / 4.7e-2 | 8.6e-2 / 4.1e-2 | 6.0e-2 / 4.7e-2 / 2.0e-2 |
+| target | logistic k=10 / 20 | ES k=10 / 20 | GRPO k=10 / 20 | random (logistic / ES / GRPO) |
+|---|---|---|---|---|
+| sphere flank | 1.5e-2 / 1.1e-2 | 1.1e-2 / 9.7e-3 | 1.0e-2 / 1.1e-2 | 8.9e-3 / 9.5e-3 / 9.5e-3 |
 
-* At k = 10 nearly every lattice point ends up on the right side: 100 % on the
-  sphere flank and cap with 16 values, 98–99 % on torus inner. The surface is
-  still free to move anywhere between neighbouring lattice points, about 0.2
-  apart. So on flanks the RMS is about 1.5× that of random near-surface
-  sampling, and the accuracy on random validation points is lower (95–98 %
-  instead of 98 %).
-* k = 20 usually closes much of that gap (ES and GRPO on the cap and torus
-  inner), but costs about 3× more time for ES and GRPO.
-* One 16-value GRPO run at k = 20 (sphere flank) had a small extra surface piece.
-  The report flags these.
+* At k = 10 nearly every lattice point ends up on the right side, but the surface
+  is still free to move anywhere between neighbouring lattice points, about 0.2
+  apart. So the RMS is up to 1.7× that of random near-surface sampling (logistic).
+* k = 20 closes part of that gap, at about 3× the time for ES and GRPO.
 
-## Benchmark: all optimizers of the 16-value cube on the three sphere targets
+## Grids of cubes (`code/grid`)
 
-`python code/benchmark/benchmark_warp.py` (about 12 min) runs every method with its default
-settings on `sphere`, `sphere cap` and `sphere flank`, with 3 seeds each.
+A grid of `nx × ny × nz` cubic cells of edge `h` over a box, with the numbers stored
+at the `(nx+1)(ny+1)(nz+1)` grid vertices. Every cell is a cube as above, and
+neighbouring cells share the numbers on their common corners, so the field is
+continuous over the whole grid and the surface can close: a sphere, an ellipsoid or a
+torus comes out as one watertight mesh. The single-cube code above is unchanged and
+keeps its own tests; a `1 × 1 × 1` grid is exactly the 8-value cube (tested).
 
 ```bash
-python code/benchmark/benchmark_warp.py --save-fits     # results, best fits and overview_best.png -> data/benchmark/
-python code/benchmark/benchmark_warp.py --save-fits --save-all-seeds   # every seed, + median / worst overviews
-python code/benchmark/benchmark_warp.py --from-json data/benchmark/benchmark_warp.json   # tables again, no rerun
-python code/visualization/warp_viewer.py                # the saved fits are in the combo box
+python code/grid/grid_optimize.py --function sphere_medium                 # fit: scalar grid, 8³ cells
+python code/grid/grid_optimize.py --function torus_medium --model warp     # value + displacement per vertex
+python code/grid/grid_optimize.py --points my_scan.ply --dims 16           # a point cloud
+python code/visualization/grid_viewer.py                                   # look at examples and fits
+python code/tests/test_grid.py
 ```
 
-* **Own loss** is the objective each method minimises, at its result. It can only
-  be compared within a row:
-  * Sampson: f²/|∇f|² + normal term;
-  * chamfer: the chamfer loss;
-  * logistic: the softplus loss on the last batch;
-  * ES / GRPO: (1 − R)/2, the misclassification rate of the last population.
-* **CD** is the same measure for all methods: the two-sided chamfer distance
-  `mean d(p, target)² + mean d(q, fit)²`, in world units² (cube width 2), with
-  exact point-to-surface distances.
-  * p are 20 000 samples of the fitted mesh at depth 6; q are 20 000 target
-    samples that no method was trained on.
-  * Point-to-point distances between two sample sets would add a floor of about
-    0.008, larger than the differences measured here.
-* Values are medians over the 3 seeds; the worst seed is in parentheses.
-  `*` marks one seed whose surface had extra pieces.
+### Two models (`--model`)
 
-| method | kind | time (s) | sphere: own loss | sphere: CD ×1e-4 | cap: own loss | cap: CD ×1e-4 | flank: own loss | flank: CD ×1e-4 |
-|---|---|---|---|---|---|---|---|---|
-| Sampson multi-start (stage 1) | differentiable | 11 | 5.2e-3 | 440 (1400) ** | 2.0e-3 | **0.78** (0.94) | 5.5e-6 | **0.11** (0.12) |
-| chamfer (stage 1 + 300 Adam) | differentiable | 35 | 4.1e-2 | 440 (1400) *** | 8.8e-4 | **0.74** (0.80) | 9.8e-4 | **0.11** (0.12) |
-| logistic, random | differentiable | 4 | 3.6e-1 | 93 (790) ** | 1.1e-1 | 3.7 (5.0) | 5.6e-2 | 0.71 (0.72) |
-| logistic, lattice 10³ | differentiable | 2 | 9.6e-2 | 62 (62) | 2.1e-2 | 11 (15) | 1.1e-2 | 2.0 (2.0) |
-| ES, random | reward only | 11 | 1.2e-1 | **26** (27) ** | 5.6e-2 | 6.8 (7.8) | 2.5e-2 | 0.8 (120) * |
-| ES, lattice 10³ | reward only | 4 | 2.8e-2 | **23** (23) * | 1.1e-2 | 25 (230) | 4.7e-3 | 1.5 (1.6) |
-| GRPO, random | reward only | 15 | 8.8e-2 | 28 (700) * | 3.7e-2 | 12 (29) | 1.9e-2 | 1.3 (1.6) |
-| GRPO, lattice 10³ | reward only | 7 | 5.4e-2 | 210 (580) | 6.7e-3 | 43 (45) | 8.6e-4 | 2.3 (2.4) |
+| model | numbers per vertex | field |
+|---|---|---|
+| `scalar` (default) | 1: a value `G` | `f(x) = Σ_n w_n(t) G[corner n of x's cell]`, trilinear in every cell |
+| `warp` | 4: a value `G` and a 3D displacement `D`, in cell units | `x' = x + h Σ_n w_n(t) D[corner n]`, then `f(x) = G(x')`, the scalar grid at `x'` |
 
-(Times are medians over all runs; `sphere` runs take about 1.5× longer for the
-chamfer method.)
+`t ∈ [0, 1]³` are the local coordinates of `x` in its cell and `w_n` the trilinear
+weights, with the corner order `n = i + 2j + 4k` used everywhere.
 
-**What it shows**
+* The displacement and `G` are both interpolated over the whole grid, so the warp
+  field is continuous too. `D = 0` gives the scalar model. On a single cell the warp
+  model has 8 values + 8 displacements = 32 numbers.
+* `x'` may land in another cell. It is clamped to the grid domain: `G` is only
+  defined on the grid, and extending a boundary cell's polynomial outwards made small
+  spurious surface pieces at the domain faces.
+* Gradients with respect to `x` are analytic (`∇f = Jᵀ ∇G(x')`, with
+  `J = I + h ∂D/∂x`), and everything is differentiable in the numbers.
 
-* **Cap and flank (the surface fits in one cube).** The surface-based,
-  differentiable methods win clearly.
-  * The multi-start Sampson fit reaches CD 0.78e-4 / 0.11e-4 (RMS 6e-3 / 2e-3) in
-    11 s. The chamfer refinement adds 20–25 s for a small gain (cap 0.78 → 0.74,
-    flank unchanged).
-  * The classifiers are 5–100× worse in CD. Logistic is the best and fastest of
-    them (cap 3.7e-4 in 4 s).
-  * ES and GRPO, which only see the reward, are 2–3× slower, worse, and vary
-    more between seeds.
-  * Lattice sampling is the fastest but loses accuracy: 1000 fixed points
-    leave the surface free between them.
-* **Whole sphere (a closed surface, not representable by one cube).** Every
-  method is poor (RMS ≥ 0.03 on a sphere of radius 0.8), but the order is
-  reversed.
-  * The Sampson and chamfer fits fall into solutions with extra closed pieces
-    in 2–3 of 3 seeds (CD 4e-2 to 1.4e-1).
-  * ES is the most reliable (CD about 2.5e-3 for every seed, random or
-    lattice). A volume reward penalises wrong inside/outside everywhere in the
-    cube, while the surface losses only look near the target samples, and
-    bubbles away from them cost little.
-* **Own loss vs CD.** Within a method, a lower own loss does not mean a better
-  surface. Every lattice variant has a lower own loss than its random version,
-  because 1000 fixed points are easier to classify, yet it has a higher CD.
-  On the sphere, no chamfer step beat the multi-start result, so keep-best
-  returned it unchanged and the two rows have the same CD.
+### Meshing (`grid_marching.py`)
+
+Every cell is split into `2^depth` sub-cells per axis (`--depth`, default 2), and the
+field is evaluated once at every lattice point, so neighbouring cells always agree.
+The sub-cells whose corners change sign are triangulated with the case table, face
+decider and welding of the single-cube mesher, and one vertex is placed on each
+crossed lattice edge:
+
+* **scalar**: exact, because the field is linear along a lattice edge;
+* **warp**: found by bisection, then written as `t = t* − f/f_t` with `f_t`
+  detached, so the vertices are differentiable (implicit-function derivative).
+
+The mesh is watertight wherever the surface is inside the grid. `mesh_check` checks
+it: every edge is shared by two consistently oriented triangles, except edges on the
+domain faces where a surface leaves the grid.
+
+### Targets (`targets.py`)
+
+`--function FILE` or `--points FILE`. Wherever a target is asked for, the name of an
+example (below) works as well as a path.
+
+* **Function file**: a Python file defining `g(X)` for an `(..., 3)` NumPy array,
+  negative inside, and optionally a display name:
+
+  ```python
+  import numpy as np
+  NAME = "my sphere"
+
+  def g(X):
+      return np.linalg.norm(X - np.array([0.1, 0.0, 0.0]), axis=-1) - 0.5
+  ```
+
+  It is meshed on a fine lattice over the domain, sampled area-uniformly, and the
+  samples are projected onto `g = 0`, as for the single cube.
+* **Point cloud**: `.xyz`, `.txt`, `.csv`, `.pts` (columns `x y z [nx ny nz]`),
+  `.npy`, `.ply` (ASCII or binary) or `.obj` (vertices and vertex normals). Without
+  normals they are estimated: PCA over the 16 nearest neighbours, oriented
+  consistently by propagating over the neighbour graph, and outward at the point of
+  largest x of each piece.
+* **Inside/outside** (for the classification methods): the sign of `g`, or for a
+  cloud the side of the nearest point's tangent plane.
+* **Distances** (for the errors): `|g| / |∇g|`, or for a cloud the distance to the
+  nearest point's tangent plane, unless the offset along that plane is more than 4
+  point spacings (beyond the edge of an open cloud), then to the point itself. A fit
+  from the sphere cloud measures the same against the cloud as against the exact
+  sphere (2.9e-3). With a 2-spacing limit it measured 6.4e-3: 6 % of the points of a
+  perfect surface fall in a gap between random samples that wide.
+
+**The grid domain.** For a function, `[-1, 1]³` or `--lo X Y Z --size S`. For a
+point cloud, `[-1, 1]³` if the cloud lies inside it, otherwise its bounding box plus
+one cell of margin (`--fit-domain` always does that). `--dims n` (or `nx ny nz`) sets
+the cells per axis; cells are always cubes.
+
+### Examples (`examples/`)
+
+Nine functions in `examples/functions/`, and the same shapes as point clouds in
+`examples/point_clouds/` (5000 points each, with normals, written by
+`make_examples.py`), all inside `[-1, 1]³`:
+
+| examples | sizes |
+|---|---|
+| `sphere_small`, `sphere_medium`, `sphere_large` | radius 0.3, 0.55, 0.8 |
+| `ellipsoid_small`, `ellipsoid_flat`, `ellipsoid_long` | semi-axes (0.4, 0.25, 0.18), (0.8, 0.5, 0.25), (0.85, 0.3, 0.3); the small and long ones rotated |
+| `torus_small`, `torus_medium`, `torus_large_thin` | major / tube radius 0.35 / 0.12, 0.55 / 0.2, 0.75 / 0.12; the small and thin ones rotated |
+
+Two more point clouds test harder input: `torus_medium_no_normals` (positions only,
+the normals are estimated) and `sphere_medium_noisy` (Gaussian noise of std 0.005,
+no normals).
+
+### Fitting (`grid_optimize.py`)
+
+`--method chamfer` (default) has three stages:
+
+1. **Closed-form start** for `G`: least squares on `f(q) = 0` and `h ∇f(q) = n` at
+   the target points `(q, n)`, a small smoothness term (second differences of `G`),
+   and a pull of every vertex towards its estimated signed distance (distance to the
+   nearest target point, with the target's inside/outside sign). The pull keeps the
+   vertices far from the target well defined. It is solved for each weight in
+   `--anchor-weights` (0.03 and 0.3), and the result with the fewest surface pieces,
+   then the lowest RMS, is kept. 0.03 is best for shapes several cells thick, 0.3 for
+   thin ones: on the small ellipsoid (0.36 thick, 1.4 cells) 0.03 gave 3 pieces at
+   RMS 6e-2, 0.3 one piece at 2.2e-2.
+2. **Sampson fit** (L-BFGS, no mesh) of `f(q)² / |∇f(q)|²`: the scalar grid first,
+   then for the warp model `G` and `D` together, plus `--disp-penalty · mean(D²)`.
+3. **Chamfer refinement through marching cubes** (Adam, `--iters`): mesh samples to
+   the target's tangent planes and target points to the mesh triangles, so the loss
+   has no sampling floor. The best iterate is kept.
+
+After stage 1, a result replaces the current one only if it lowers the RMS **without
+adding surface pieces**. Small detached pieces barely change the RMS but are wrong;
+without this rule the warp Sampson fit of the small ellipsoid "improved" the RMS
+while making 9 pieces.
+
+`--method logistic | es | grpo` are the classification optimizers of
+`classify_optimize.py`, with the points labelled by the target. They start from each
+vertex's own label (±1), and for the warp model the scalar grid is trained first.
+On grids ES and GRPO use learning rate 0.01: with hundreds of numbers, most of whose
+estimated gradients are noise, a larger rate becomes a random walk that flips signs
+and creates extra pieces. `--chamfer-iters N` refines the result with stage 3.
+
+```bash
+python code/grid/grid_optimize.py --list                                    # the example targets
+python code/grid/grid_optimize.py --function sphere_medium                  # scalar, 8³ cells, chamfer
+python code/grid/grid_optimize.py --function torus_small --model warp --dims 12
+python code/grid/grid_optimize.py --function my_shape.py --lo -2 -2 -2 --size 4
+python code/grid/grid_optimize.py --points ellipsoid_long --dims 10
+python code/grid/grid_optimize.py --points my_scan.ply --fit-domain          # grid around the cloud
+python code/grid/grid_optimize.py --points torus_medium_no_normals           # normals estimated
+python code/grid/grid_optimize.py --function sphere_small --method logistic --chamfer-iters 100
+python code/grid/grid_optimize.py --function sphere_small --method grpo --dims 4
+```
+
+| option | default | meaning |
+|---|---|---|
+| `--function`, `--points` | | the target: a file, or an example name |
+| `--model` | scalar | `scalar` or `warp` |
+| `--dims` | 8 | cells per axis: `n`, or `nx ny nz` |
+| `--lo`, `--size`, `--fit-domain` | | the grid domain (see Targets) |
+| `--depth` | 2 | marching-cubes subdivision of each cell |
+| `--method` | chamfer | `chamfer`, `logistic`, `es`, `grpo` |
+| `--anchor-weights`, `--normal-weight`, `--smooth-weight` | 0.03 0.3, 1, 0.01 | chamfer stage 1 |
+| `--sampson-iters` | 100 | chamfer stage 2 |
+| `--iters`, `--lr` | 300, 1e-3 | chamfer stage 3 |
+| `--disp-penalty` | 1e-3 | warp: λ · mean(D²), D in cells (also used by the classifiers) |
+| `--samples` | 3000 | target points used by the optimizers |
+| `--class-iters`, `--class-lr`, `--sampling`, … | 400, … | classification: the options of `classify_optimize.py` |
+| `--chamfer-iters` | 0 | classification: chamfer refinement afterwards |
+| `--out` | | the fit file; default `data/fits/grid/<target>__<model>__<method>__<cells>.json`, with `_cloud` after the target name for a point cloud |
+
+The report gives the two-sided RMS distance (exact point-to-mesh distances), the
+maxima in both directions, the RMS in cells, the number of surface pieces, the
+watertightness check and, for warp, the largest displacement.
+
+### Viewing
+
+```bash
+python code/visualization/grid_viewer.py                                   # examples and fits in the combo box
+python code/visualization/grid_viewer.py --function torus_medium --dims 6
+python code/visualization/grid_viewer.py --points sphere_medium_noisy
+python code/visualization/grid_viewer.py --load sphere_medium__warp__chamfer__8.json
+python code/visualization/grid_viewer.py --load torus_medium_cloud__scalar__chamfer__8.json
+python code/visualization/grid_overview.py                                 # images of all fits
+```
+
+* The combo box lists the example functions and point clouds and every grid fit in
+  `data/fits/grid` and the current folder.
+* The target is drawn in transparent orange (a mesh, or points for a cloud), the
+  fitted surface in blue (inside face orange). Also drawn: the domain box, optionally
+  every cell edge, and for warp fits the displacement arrows `h · D` at the vertices.
+* With an example selected, the cells-per-axis slider and the model choice set up a
+  grid, and **Fit (chamfer)** fits it from the window (20–60 s) and saves it to
+  `data/fits/grid`. Sliders for the meshing depth and the iso level, and the error
+  panel, work for any fit.
+* `grid_overview.py` renders the fits in `data/fits/grid` without a window, into
+  `overview_functions.png` and `overview_point_clouds.png` there: a row per target,
+  the target first, then every fit of it.
+
+### All examples (`fit_examples.py`)
+
+```bash
+python code/grid/fit_examples.py                         # 9 functions x (scalar, warp), 8³ cells: about 10 min
+python code/grid/fit_examples.py --points                # the 11 point clouds: about 13 min
+python code/grid/fit_examples.py --dims 16 --examples torus_small ellipsoid_small   # 1-4 min per fit
+python code/grid/fit_examples.py --method logistic
+```
+
+**Results** (chamfer, depth 2, default settings). RMS distance in world units
+(the domain is 2 wide), and in cells in parentheses (cell 0.25 at 8³, 0.125 at
+16³). All 80 fits are one closed, watertight piece, like their targets. A fit takes
+20–70 s at 8³ and 1–4 min at 16³ (warp about twice as long as scalar), on 2 CPU cores.
+
+Functions:
+
+| example | scalar 8³ | warp 8³ | scalar 16³ | warp 16³ |
+|---|---|---|---|---|
+| `ellipsoid_flat` | 3.3e-03 (0.013) | 1.5e-03 (0.006) | 1.0e-03 (0.008) | 8.8e-04 (0.007) |
+| `ellipsoid_long` | 8.5e-03 (0.034) | 4.5e-03 (0.018) | 2.0e-03 (0.016) | 1.3e-03 (0.010) |
+| `ellipsoid_small` | 1.1e-02 (0.043) | 5.7e-03 (0.023) | 4.1e-03 (0.033) | 8.1e-04 (0.006) |
+| `sphere_large` | 1.2e-03 (0.005) | 1.1e-03 (0.005) | 8.1e-04 (0.006) | 7.7e-04 (0.006) |
+| `sphere_medium` | 2.8e-03 (0.011) | 1.8e-03 (0.007) | 1.0e-03 (0.008) | 9.2e-04 (0.007) |
+| `sphere_small` | 5.3e-03 (0.021) | 3.5e-03 (0.014) | 2.0e-03 (0.016) | 1.3e-03 (0.010) |
+| `torus_large_thin` | 1.2e-02 (0.047) | 3.4e-03 (0.013) | 2.3e-03 (0.018) | 1.4e-03 (0.011) |
+| `torus_medium` | 3.7e-03 (0.015) | 2.6e-03 (0.010) | 1.7e-03 (0.014) | 1.2e-03 (0.009) |
+| `torus_small` | 2.4e-02 (0.098) | 4.0e-03 (0.016) | 3.3e-03 (0.026) | 1.8e-03 (0.014) |
+
+Point clouds (5000 points each):
+
+| point cloud | scalar 8³ | warp 8³ | scalar 16³ | warp 16³ |
+|---|---|---|---|---|
+| `ellipsoid_flat` | 3.2e-03 (0.013) | 2.4e-03 (0.009) | 1.1e-03 (0.009) | 9.6e-04 (0.008) |
+| `ellipsoid_long` | 8.4e-03 (0.034) | 4.5e-03 (0.018) | 2.0e-03 (0.016) | 1.3e-03 (0.010) |
+| `ellipsoid_small` | 1.0e-02 (0.042) | 5.6e-03 (0.022) | 4.0e-03 (0.032) | 2.3e-03 (0.019) |
+| `sphere_large` | 1.1e-03 (0.004) | 1.0e-03 (0.004) | 7.3e-04 (0.006) | 6.4e-04 (0.005) |
+| `sphere_medium` | 2.8e-03 (0.011) | 1.8e-03 (0.007) | 1.1e-03 (0.009) | 9.6e-04 (0.008) |
+| `sphere_medium_noisy` | 6.1e-03 (0.024) | 4.8e-03 (0.019) | 4.7e-03 (0.038) | 4.6e-03 (0.037) |
+| `sphere_small` | 5.2e-03 (0.021) | 3.5e-03 (0.014) | 2.0e-03 (0.016) | 1.2e-03 (0.009) |
+| `torus_large_thin` | 1.2e-02 (0.047) | 3.3e-03 (0.013) | 2.5e-03 (0.020) | 1.1e-03 (0.009) |
+| `torus_medium` | 3.6e-03 (0.015) | 2.5e-03 (0.010) | 1.7e-03 (0.013) | 1.1e-03 (0.009) |
+| `torus_medium_no_normals` | 3.7e-03 (0.015) | 2.6e-03 (0.010) | 1.7e-03 (0.014) | 1.2e-03 (0.010) |
+| `torus_small` | 2.5e-02 (0.098) | 1.4e-02 (0.055) | 3.9e-03 (0.031) | 2.3e-03 (0.018) |
+
+* **16³ against 8³.** Halving the cell size cuts the error 1.5–4× on the shapes that
+  8³ already resolves, and 2–7× on the thin ones (small ellipsoid, small torus, thin
+  torus), which are crude with the scalar model at 8³: the small torus's tube radius
+  (0.12) is under half a cell there.
+* **Warp against scalar.** At 8³ warp is better on every example: 1.0–1.6× on the
+  spheres and the medium torus, about 2× on the ellipsoids, 3.5–6× on the two thin
+  tori. At 16³ the gap shrinks to 1.05–1.8× (5× on the small ellipsoid). A finer grid
+  still helps more than the warp: scalar 16³ (4913 numbers) beats warp 8³ (2916
+  numbers) on every example.
+* **Point clouds fit about as well as the functions** they were sampled from, also
+  with estimated normals (`torus_medium_no_normals`). The noisy cloud (std 0.005)
+  stays at about 4.6e-3 even at 16³: the error is measured to the noisy points, so
+  the noise is a floor.
+* **Open issue: warp fits of some point clouds.** Three are 1.6–3× behind the same
+  shape's function fit: the small torus at 8³ (1.4e-2 against 4.0e-3), the flat
+  ellipsoid at 8³ (2.4e-3 against 1.5e-3) and the small ellipsoid at 16³ (2.3e-3
+  against 8.1e-4). In the two checked (small torus 8³, small ellipsoid 16³) the warp
+  Sampson stage was rejected, so the refinement started from the scalar start. For the
+  small torus the rejected result had a tiny detached piece (16 triangles). A possible
+  fix is to also refine from the rejected result, or to remove tiny pieces before
+  comparing.
+
+`grid_overview.py` draws all of these; `overview_functions.png` and
+`overview_point_clouds.png` in `data/fits/grid` show them next to their targets.
