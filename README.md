@@ -62,9 +62,9 @@ the fit files of the folder they are started from and of those folders, and
 cd cubespline
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest code/tests -q                         # all tests (49), about 1 min
+python -m pytest code/tests -q                         # all tests (52), about 1 min
 python code/tests/test_cubespline.py                   # or one file at a time
-python code/tests/test_grid.py                         # only the grid tests (18), about 20 s
+python code/tests/test_grid.py                         # only the grid tests (21), about 25 s
 ```
 
 ## Use
@@ -300,7 +300,7 @@ are three ways around that:
 |---|---|---|
 | `logistic` (default) | a smooth version of the reward: `softplus(−y f / τ)` + weight decay | Adam on its gradient. This is logistic regression; for the 8-value cube the features are the 8 trilinear weights, so the loss is **convex**: one optimum, reached from zero values. |
 | `es` | the true ±1 reward | evolution strategies (REINFORCE / policy gradient on the values): sample `θ = μ + σε` in ± pairs, rank the rewards, step μ along `Σ u_i ε_i / (pop σ)` with Adam. No derivative of f is used. |
-| `grpo` | the true ±1 reward | Group Relative Policy Optimization (as in DeepSeek-R1 training): a Gaussian policy N(μ, diag σ²) over the values, with **μ and σ both learned**. Each iteration samples a group of G value vectors on the same batch of points, takes advantages `A_i = (R_i − mean R) / std R` (no critic), and runs `--grpo-epochs` Adam steps on the PPO clipped surrogate `min(r_i A_i, clip(r_i, 1±ε) A_i)`, optionally minus β·KL(π‖π_ref). |
+| `grpo` | the true ±1 reward | Group Relative Policy Optimization (as in DeepSeek-R1 training): a Gaussian policy N(μ, diag σ²) over the values, with **μ and σ both learned**. Each iteration samples a group of G value vectors on the same batch of points, takes advantages `A_i = (R_i − mean R) / std R` (no critic), and runs `--grpo-epochs` Adam steps on the PPO clipped surrogate `min(r_i A_i, clip(r_i, 1±ε) A_i)`, with the ratio capped at 3 (dual clip), optionally minus β·KL(π‖π_ref). |
 
 Samples (`--sampling`):
 
@@ -352,21 +352,37 @@ start, and β = 0.04 (the DeepSeek value) made the fits worse. Without it, the
 reference policy plays no role. The learned σ shrinks by itself (0.2 → about
 0.003 over a run), which replaces the fixed σ schedule of ES.
 
+**The ratio cap.** The ratio `r_i = π(θ_i) / π_old(θ_i)` is a product over all the
+numbers, and Adam moves every one of them by about the learning rate. So the policy
+moves far in one epoch: for the 8-value cube the approximate KL is already 0.3–0.5
+after the first epoch (PPO usually aims at about 0.01), and on grids (729–19652
+numbers) the log-ratios reach tens to hundreds, with 85–100 % of the samples outside
+the clip range. A sample with a huge ratio and a negative advantage is not clipped by
+the PPO surrogate, so it set the whole gradient, and on warp 16³ grids `exp` overflowed
+(7 of 20 runs ended in NaN). The ratio is now capped at 3 (dual-clip PPO, Ye et al.
+2020). On the single cube that changes the results only within the spread between
+seeds. On grids it removes the crashes but does not make GRPO better: over the 80
+example fits (20 targets, scalar and warp, 8³ and 16³) the geometric-mean RMS is the
+same within 1 %, and the warp 16³ fits stay poor (0.12 cells, 16 of 20 with extra
+pieces). A smaller step per epoch (a KL target, or a learning rate that shrinks with the
+number of values) is not used: it would change the single-cube results too.
+
 ### Results (default settings, about 1–2 s per run)
 
 RMS distance to the target (cube width 2); the last column is the chamfer
-optimizer (`optimize.py`) from the tables above.
+optimizer (`optimize.py`) from the tables above. The GRPO column is with the ratio cap
+(rerun 2026-11-22).
 
 | target | logistic | ES | GRPO | chamfer |
 |---|---|---|---|---|
-| sphere flank | 8.9e-3 | 9.5e-3 | 9.5e-3 | 8.4e-3 |
-| large sphere flank | 3.7e-3 | 3.8e-3 | 3.7e-3 | 3.5e-3 |
-| torus outer flank | 8.8e-3 | 9.0e-3 | 9.3e-3 | 8.5e-3 |
-| torus inner flank | 7.0e-3 | 6.7e-3 | 7.4e-3 | 6.7e-3 |
-| sphere cap | 8.8e-2 | 1.0e-1 | 1.1e-1 | 8.7e-2 |
+| sphere flank | 8.9e-3 | 9.5e-3 | 1.0e-2 | 8.4e-3 |
+| large sphere flank | 3.7e-3 | 3.8e-3 | 3.8e-3 | 3.5e-3 |
+| torus outer flank | 8.8e-3 | 9.0e-3 | 9.2e-3 | 8.5e-3 |
+| torus inner flank | 7.0e-3 | 6.7e-3 | 7.3e-3 | 6.7e-3 |
+| sphere cap | 8.8e-2 | 1.0e-1 | 1.0e-1 | 8.7e-2 |
 | large sphere cap | 1.1e-2 | 1.0e-2 | 9.8e-3 | 9.4e-3 |
 | torus outer | 1.1e-1 | 1.2e-1 | 1.1e-1 | 9.8e-2 |
-| torus inner | 1.3e-1 | 1.5e-1 | 1.4e-1 | 1.3e-1 |
+| torus inner | 1.3e-1 | 1.5e-1 | 1.2e-1 | 1.3e-1 |
 
 * All three methods match the chamfer optimizer, starting from zero values, with
   no closed-form start and no mesh.
@@ -379,8 +395,10 @@ above). The lattice is 10³ = 1000 or 20³ = 8000 cell-centre points.
 
 | target | logistic k=10 / 20 | ES k=10 / 20 | GRPO k=10 / 20 | random (logistic / ES / GRPO) |
 |---|---|---|---|---|
-| sphere flank | 1.5e-2 / 1.1e-2 | 1.1e-2 / 9.7e-3 | 1.0e-2 / 1.1e-2 | 8.9e-3 / 9.5e-3 / 9.5e-3 |
+| sphere flank | 1.5e-2 / 1.1e-2 | 1.1e-2 / 9.7e-3 | 1.4e-2 / 1.1e-2 | 8.9e-3 / 9.5e-3 / 1.0e-2 |
 
+* One seed per entry, and the spread between seeds is large: GRPO at k = 10 gives
+  0.94–1.4e-2 over seeds 0–3 (1.0–1.7e-2 before the ratio cap).
 * At k = 10 nearly every lattice point ends up on the right side, but the surface
   is still free to move anywhere between neighbouring lattice points, about 0.2
   apart. So the RMS is up to 1.7× that of random near-surface sampling (logistic).
@@ -505,7 +523,14 @@ no normals).
    thin ones: on the small ellipsoid (0.36 thick, 1.4 cells) 0.03 gave 3 pieces at
    RMS 6e-2, 0.3 one piece at 2.2e-2.
 2. **Sampson fit** (L-BFGS, no mesh) of `f(q)² / |∇f(q)|²`: the scalar grid first,
-   then for the warp model `G` and `D` together, plus `--disp-penalty · mean(D²)`.
+   then for the warp model `G` and `D` together, plus `--disp-penalty · mean(D²)` and
+   a **sign term** `--shell-weight · mean(relu(d − y f)²)` at 6000 points 0.25–1.5
+   cells off the target, on both sides (`y` the target's inside/outside label, `d` the
+   distance to the target in cells; `f` is about the signed distance in cells). The
+   Sampson loss only sees the target points, and without the sign term `D` often made
+   a small bubble of the wrong sign 0.5–1 cell off the surface: an extra surface piece,
+   so the stage was rejected and the refinement started from `D = 0` (see
+   [the warp Sampson stage](#the-warp-sampson-stage)).
 3. **Chamfer refinement through marching cubes** (Adam, `--iters`): mesh samples to
    the target's tangent planes and target points to the mesh triangles, so the loss
    has no sampling floor. The best iterate is kept.
@@ -546,6 +571,7 @@ python code/grid/grid_optimize.py --function sphere_small --method grpo --dims 4
 | `--sampson-iters` | 100 | chamfer stage 2 |
 | `--iters`, `--lr` | 300, 1e-3 | chamfer stage 3 |
 | `--disp-penalty` | 1e-3 | warp: λ · mean(D²), D in cells (also used by the classifiers) |
+| `--shell-weight` | 1e-2 | warp, chamfer stage 2: weight of the sign term off the target (0 = off) |
 | `--samples` | 3000 | target points used by the optimizers |
 | `--class-iters`, `--class-lr`, `--sampling`, … | 400, … | classification: the options of `classify_optimize.py` |
 | `--chamfer-iters` | 0 | classification: chamfer refinement afterwards |
@@ -592,58 +618,86 @@ python code/grid/fit_examples.py --method logistic
 (the domain is 2 wide), and in cells in parentheses (cell 0.25 at 8³, 0.125 at
 16³). All 80 fits are one closed, watertight piece, like their targets. A fit takes
 20–70 s at 8³ and 1–4 min at 16³ (warp about twice as long as scalar), on 2 CPU cores.
+The warp columns were rerun on 2026-11-22 with the sign term in stage 2 (see
+[the warp Sampson stage](#the-warp-sampson-stage)); the scalar columns are unchanged.
 
 Functions:
 
 | example | scalar 8³ | warp 8³ | scalar 16³ | warp 16³ |
 |---|---|---|---|---|
-| `ellipsoid_flat` | 3.3e-03 (0.013) | 1.5e-03 (0.006) | 1.0e-03 (0.008) | 8.8e-04 (0.007) |
-| `ellipsoid_long` | 8.5e-03 (0.034) | 4.5e-03 (0.018) | 2.0e-03 (0.016) | 1.3e-03 (0.010) |
-| `ellipsoid_small` | 1.1e-02 (0.043) | 5.7e-03 (0.023) | 4.1e-03 (0.033) | 8.1e-04 (0.006) |
-| `sphere_large` | 1.2e-03 (0.005) | 1.1e-03 (0.005) | 8.1e-04 (0.006) | 7.7e-04 (0.006) |
-| `sphere_medium` | 2.8e-03 (0.011) | 1.8e-03 (0.007) | 1.0e-03 (0.008) | 9.2e-04 (0.007) |
-| `sphere_small` | 5.3e-03 (0.021) | 3.5e-03 (0.014) | 2.0e-03 (0.016) | 1.3e-03 (0.010) |
-| `torus_large_thin` | 1.2e-02 (0.047) | 3.4e-03 (0.013) | 2.3e-03 (0.018) | 1.4e-03 (0.011) |
-| `torus_medium` | 3.7e-03 (0.015) | 2.6e-03 (0.010) | 1.7e-03 (0.014) | 1.2e-03 (0.009) |
-| `torus_small` | 2.4e-02 (0.098) | 4.0e-03 (0.016) | 3.3e-03 (0.026) | 1.8e-03 (0.014) |
+| `ellipsoid_flat` | 3.3e-03 (0.013) | 1.8e-03 (0.007) | 1.0e-03 (0.008) | 7.6e-04 (0.006) |
+| `ellipsoid_long` | 8.5e-03 (0.034) | 2.1e-03 (0.008) | 2.0e-03 (0.016) | 7.8e-04 (0.006) |
+| `ellipsoid_small` | 1.1e-02 (0.043) | 2.9e-03 (0.012) | 4.1e-03 (0.033) | 8.2e-04 (0.007) |
+| `sphere_large` | 1.2e-03 (0.005) | 1.1e-03 (0.004) | 8.1e-04 (0.006) | 5.6e-04 (0.004) |
+| `sphere_medium` | 2.8e-03 (0.011) | 1.5e-03 (0.006) | 1.0e-03 (0.008) | 6.6e-04 (0.005) |
+| `sphere_small` | 5.3e-03 (0.021) | 2.3e-03 (0.009) | 2.0e-03 (0.016) | 6.7e-04 (0.005) |
+| `torus_large_thin` | 1.2e-02 (0.047) | 3.4e-03 (0.014) | 2.3e-03 (0.018) | 1.5e-03 (0.012) |
+| `torus_medium` | 3.7e-03 (0.015) | 2.2e-03 (0.009) | 1.7e-03 (0.014) | 9.4e-04 (0.007) |
+| `torus_small` | 2.4e-02 (0.098) | 3.3e-03 (0.013) | 3.3e-03 (0.026) | 1.0e-03 (0.008) |
 
 Point clouds (5000 points each):
 
 | point cloud | scalar 8³ | warp 8³ | scalar 16³ | warp 16³ |
 |---|---|---|---|---|
-| `ellipsoid_flat` | 3.2e-03 (0.013) | 2.4e-03 (0.009) | 1.1e-03 (0.009) | 9.6e-04 (0.008) |
-| `ellipsoid_long` | 8.4e-03 (0.034) | 4.5e-03 (0.018) | 2.0e-03 (0.016) | 1.3e-03 (0.010) |
-| `ellipsoid_small` | 1.0e-02 (0.042) | 5.6e-03 (0.022) | 4.0e-03 (0.032) | 2.3e-03 (0.019) |
-| `sphere_large` | 1.1e-03 (0.004) | 1.0e-03 (0.004) | 7.3e-04 (0.006) | 6.4e-04 (0.005) |
-| `sphere_medium` | 2.8e-03 (0.011) | 1.8e-03 (0.007) | 1.1e-03 (0.009) | 9.6e-04 (0.008) |
-| `sphere_medium_noisy` | 6.1e-03 (0.024) | 4.8e-03 (0.019) | 4.7e-03 (0.038) | 4.6e-03 (0.037) |
-| `sphere_small` | 5.2e-03 (0.021) | 3.5e-03 (0.014) | 2.0e-03 (0.016) | 1.2e-03 (0.009) |
-| `torus_large_thin` | 1.2e-02 (0.047) | 3.3e-03 (0.013) | 2.5e-03 (0.020) | 1.1e-03 (0.009) |
-| `torus_medium` | 3.6e-03 (0.015) | 2.5e-03 (0.010) | 1.7e-03 (0.013) | 1.1e-03 (0.009) |
-| `torus_medium_no_normals` | 3.7e-03 (0.015) | 2.6e-03 (0.010) | 1.7e-03 (0.014) | 1.2e-03 (0.010) |
-| `torus_small` | 2.5e-02 (0.098) | 1.4e-02 (0.055) | 3.9e-03 (0.031) | 2.3e-03 (0.018) |
+| `ellipsoid_flat` | 3.2e-03 (0.013) | 1.5e-03 (0.006) | 1.1e-03 (0.009) | 6.8e-04 (0.005) |
+| `ellipsoid_long` | 8.4e-03 (0.034) | 2.1e-03 (0.008) | 2.0e-03 (0.016) | 6.8e-04 (0.005) |
+| `ellipsoid_small` | 1.0e-02 (0.042) | 2.4e-03 (0.010) | 4.0e-03 (0.032) | 7.6e-04 (0.006) |
+| `sphere_large` | 1.1e-03 (0.004) | 9.4e-04 (0.004) | 7.3e-04 (0.006) | 5.5e-04 (0.004) |
+| `sphere_medium` | 2.8e-03 (0.011) | 1.5e-03 (0.006) | 1.1e-03 (0.009) | 7.4e-04 (0.006) |
+| `sphere_medium_noisy` | 6.1e-03 (0.024) | 4.9e-03 (0.020) | 4.7e-03 (0.038) | 4.6e-03 (0.037) |
+| `sphere_small` | 5.2e-03 (0.021) | 2.2e-03 (0.009) | 2.0e-03 (0.016) | 6.4e-04 (0.005) |
+| `torus_large_thin` | 1.2e-02 (0.047) | 3.2e-03 (0.013) | 2.5e-03 (0.020) | 1.2e-03 (0.009) |
+| `torus_medium` | 3.6e-03 (0.015) | 2.0e-03 (0.008) | 1.7e-03 (0.013) | 7.8e-04 (0.006) |
+| `torus_medium_no_normals` | 3.7e-03 (0.015) | 2.1e-03 (0.008) | 1.7e-03 (0.014) | 9.3e-04 (0.007) |
+| `torus_small` | 2.5e-02 (0.098) | 3.2e-03 (0.013) | 3.9e-03 (0.031) | 1.1e-03 (0.008) |
 
 * **16³ against 8³.** Halving the cell size cuts the error 1.5–4× on the shapes that
   8³ already resolves, and 2–7× on the thin ones (small ellipsoid, small torus, thin
   torus), which are crude with the scalar model at 8³: the small torus's tube radius
-  (0.12) is under half a cell there.
-* **Warp against scalar.** At 8³ warp is better on every example: 1.0–1.6× on the
-  spheres and the medium torus, about 2× on the ellipsoids, 3.5–6× on the two thin
-  tori. At 16³ the gap shrinks to 1.05–1.8× (5× on the small ellipsoid). A finer grid
-  still helps more than the warp: scalar 16³ (4913 numbers) beats warp 8³ (2916
-  numbers) on every example.
-* **Point clouds fit about as well as the functions** they were sampled from, also
-  with estimated normals (`torus_medium_no_normals`). The noisy cloud (std 0.005)
-  stays at about 4.6e-3 even at 16³: the error is measured to the noisy points, so
-  the noise is a floor.
-* **Open issue: warp fits of some point clouds.** Three are 1.6–3× behind the same
-  shape's function fit: the small torus at 8³ (1.4e-2 against 4.0e-3), the flat
-  ellipsoid at 8³ (2.4e-3 against 1.5e-3) and the small ellipsoid at 16³ (2.3e-3
-  against 8.1e-4). In the two checked (small torus 8³, small ellipsoid 16³) the warp
-  Sampson stage was rejected, so the refinement started from the scalar start. For the
-  small torus the rejected result had a tiny detached piece (16 triangles). A possible
-  fix is to also refine from the rejected result, or to remove tiny pieces before
-  comparing.
+  (0.12) is under half a cell there. For warp it cuts the error 1.7–3.5×.
+* **Warp against scalar.** Warp is better on every example. At 8³: 1.1–1.25× on the
+  large sphere and the noisy cloud, 1.7–2.4× on the other spheres, the medium torus and
+  the flat ellipsoid, 3.5–4.3× on the long and small ellipsoids and the thin torus,
+  7.5× on the small torus. At 16³: 1.3–2.1× on the large and medium spheres, the flat
+  ellipsoid and the medium and thin tori, 2.6–3.7× on the long ellipsoid, the small
+  sphere and the small torus, 5× on the small ellipsoid (the noisy cloud stays at its
+  noise floor). A finer grid still mostly helps more than the warp: scalar 16³ (4913
+  numbers) beats warp 8³ (2916 numbers) by 1.1–1.7× on most examples, they are even on
+  the long ellipsoid and the small torus function, and warp 8³ is better on the small
+  ellipsoid (1.4–1.7×) and the small torus cloud (1.2×).
+* **Point clouds fit about as well as the functions** they were sampled from (within
+  25 %), also with estimated normals (`torus_medium_no_normals`). The noisy cloud (std
+  0.005) stays at about 4.6e-3 even at 16³: the error is measured to the noisy points,
+  so the noise is a floor.
 
 `grid_overview.py` draws all of these; `overview_functions.png` and
 `overview_point_clouds.png` in `data/fits/grid` show them next to their targets.
+
+### The warp Sampson stage
+
+Before the sign term (chamfer stage 2), the warp Sampson result was rejected in 22 of
+the 40 warp fits of these tables, so their refinement started from `D = 0`: most fits
+at 16³, and function targets as well as point clouds. Whether it was rejected changed
+with the seed and with the machine (the same code, run in the cloud and on a laptop,
+disagreed on 7 of the 40, and rejected it in 22 and 19). The rejected results were 2–7× better in RMS but had one
+extra surface piece: a bubble of 4–200 triangles 0.5–1.2 cells off the surface, inside
+(f < 0) where the target is outside. The Sampson loss is measured only at the target
+points, so nothing held the sign of f away from the surface. Refining from the
+rejected result as well did not help: the bubbles survived the refinement, and more
+pieces showed at depth 3.
+
+With the sign term the warp Sampson result is one piece at depths 2 and 3 in 48 of 48
+runs (6 shapes × 8 seeds; 31 before), and all 40 fits of the tables keep it. Against
+the previous code on the same machine the final RMS is 0.64× on average (0.14–1.11×;
+only the flat ellipsoid function at 8³ got worse, 1.8e-3 against 1.6e-3), and
+0.23–0.63× on the seeds where the old code had rejected the stage. Stage 2 takes 2.5 s
+instead of 0.9 s. The warp L-BFGS also runs with tight tolerances: with the default
+ones it sometimes stopped after one step (the loss is about 1e-5), leaving `D = 0`.
+
+Two things remain:
+
+* The keep rule counts pieces at depth 2, the report at depth 3. The previous code's
+  8³ fit of the long ellipsoid on the laptop passed with one piece at depth 2 and had 5
+  at depth 3 (RMS 1.5e-2).
+* The scalar Sampson step has the same weakness: for most shapes it adds pieces and is
+  rejected. The sign term is not used there yet, so the scalar columns are unchanged.

@@ -287,6 +287,50 @@ def test_logistic_classification_on_the_grid():
         assert info["val_reward"] > 0.9, (kind, info["val_reward"])
 
 
+def test_shell_points_are_off_the_target_and_labelled():
+    grid = Grid.cube(8)
+    fn = _sphere()
+    target = T.target_from_function(fn, "sphere", grid, n=2000)
+    X, y, d = GO.shell_points(target, grid, n=2000)
+    g = fn(X.numpy())
+    assert np.array_equal(y.numpy(), np.where(g > 0, 1.0, -1.0))
+    assert np.allclose(d.numpy(), np.abs(g) / grid.h, atol=1e-6)
+    assert d.min() > 0.2 and d.max() < 1.6 and 0.4 < (y > 0).double().mean() < 0.6
+
+
+def test_warp_sampson_has_no_bubble():
+    # ellipsoid_flat cloud, 8^3, seed 5: without the sign term the warp Sampson fit had a
+    # 4-face bubble 1.2 cells off the surface and was rejected (RMS stayed 2.7x higher)
+    grid = Grid.cube(8)
+    P, N = T.load_point_cloud(T.resolve_points("ellipsoid_flat"))
+    target = T.target_from_points(P, N, "ellipsoid_flat", grid, n=3000, seed=5)
+    model = GridModel(grid, "warp")
+    p, info = GO.fit(model, target, GO.GridFitConfig(model="warp", seed=5, iters=0), verbose=False)
+    stages = dict((s[0], s[1]) for s in info["stages"])
+    assert stages["sampson"] < 0.5 * stages["closed form"], stages     # the warp stage was kept
+    for depth in (2, 3):
+        assert count_pieces(extract_topology(model, p, depth).F) == 1, depth
+
+
+def test_grpo_stays_finite_with_many_numbers():
+    # GRPO on a warp 16^3 grid (19652 numbers): the log-ratio of a sample is a sum over
+    # all the numbers, and after one Adam epoch it can pass 709, where exp() overflows
+    # and the step turned into NaN. The ratio is capped (dual clip), so it stays finite.
+    grid = Grid.cube(16)
+    target = T.target_from_function(_sphere(), "sphere", grid, n=2000)
+    model = GridModel(grid, "warp")
+    cfg = C.ClassifyConfig(method="grpo", grpo_lr=0.02, offset_penalty=1e-3)
+    gen = torch.Generator().manual_seed(0)
+    G0 = target.label(torch.as_tensor(grid.vertex_positions(), dtype=DT))
+    mu = model.normalised(model.join(G0)).requires_grad_(True)
+    policy = C.GRPOPolicy(mu, cfg)
+    sampler = GO.GridSampler(target, grid)
+    for it in range(3):
+        X, y = sampler.draw(2000, gen)
+        policy.step(model, X, y, gen, cfg.grpo_lr)
+        assert torch.isfinite(mu).all() and torch.isfinite(policy.log_std).all(), it
+
+
 def test_keep_rule_rejects_extra_pieces():
     assert GO.improves((0.01, 1), (0.02, 1))
     assert not GO.improves((0.01, 2), (0.02, 1))          # lower RMS, but a detached piece

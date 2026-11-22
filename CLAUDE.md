@@ -16,8 +16,10 @@ read the relevant section before changing a part of the code.
 - Run scripts from the project folder, e.g. `python code/grid/grid_optimize.py ...`.
   Each script puts `code/` on `sys.path` itself; modules import as packages
   (`from core.cube import Cube`, `from grid.grid import Grid`).
-- Tests: `python -m pytest code/tests -q` (49 tests, about 1 min);
-  `python code/tests/test_grid.py` for the grid only (about 20 s).
+- Tests: `python -m pytest code/tests -q` (52 tests, about 1 min);
+  `python code/tests/test_grid.py` for the grid only (about 25 s).
+- Python: use `.venv/bin/python` (or activate `.venv`); the `python` on PATH is miniconda
+  without torch.
 - Outputs: single-cube fits go to `data/fits/`, grid fits to `data/fits/grid/`
   (`<target>[_cloud]__<model>__<method>__<cells>.json`), overview images there too.
 
@@ -43,6 +45,14 @@ read the relevant section before changing a part of the code.
   vertices and create extra pieces); classification starts from the vertex labels.
 - Point-cloud distance: to the nearest point's tangent plane unless the offset along
   the plane exceeds 4 point spacings (smaller limits overstate the error).
+- Warp Sampson stage (chamfer stage 2): sign term `--shell-weight 1e-2`, margin 1, at
+  points 0.25-1.5 cells off the target, and tight L-BFGS tolerances. Without it D makes
+  wrong-sign bubbles off the surface, the stage is rejected, and the fit depends on the
+  seed and machine (README, "The warp Sampson stage"). Refining from the rejected
+  result was tried and does not help.
+- GRPO: the importance ratio is capped at 3 (`GRPOPolicy.DUAL_CLIP`, dual-clip PPO).
+  The log-ratio is a sum over all the numbers; uncapped, `exp` overflowed on warp 16^3
+  grids (NaN) and single samples dominated the gradient (README, "The ratio cap").
 
 ## Working with Tiberiu
 
@@ -53,6 +63,15 @@ read the relevant section before changing a part of the code.
 
 ## Open issues
 
-- Warp fits of some point clouds are 1.6-3x behind the function fits of the same shape
-  (README, "All examples"): the warp Sampson stage is rejected, e.g. for a tiny detached
-  piece, and the refinement then starts from the scalar start.
+- The scalar Sampson step adds pieces and is rejected for most shapes; the sign term
+  (above) is not used there yet. Tight tolerances alone already help one case (torus
+  medium cloud 16^3: L-BFGS stopped after one step). Changing it changes the scalar
+  columns of the README tables.
+- The keep rule counts pieces at depth 2, the final report at depth 3; small pieces
+  can show only at depth 3.
+- GRPO steps far outside the PPO trust region: approximate KL 0.3-0.5 after one
+  epoch on the 8-value cube, log-ratios of tens to hundreds on grids. A KL target or a
+  learning rate that shrinks with the number of values is untested; either would also
+  change the single-cube results.
+- The fits in `data/fits/grid` and its overview images are from before the sign term
+  (2026-11-22); the README warp columns are newer.

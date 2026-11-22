@@ -317,6 +317,11 @@ class GRPOPolicy:
     """Gaussian policy N(mu, diag exp(log_std)^2) over the values, trained by GRPO."""
 
     LOG_STD_MIN, LOG_STD_MAX = np.log(1e-3), np.log(1.0)
+    # Dual clip (Ye et al. 2020): the ratio counts at most 3x. The log-ratio is a sum over
+    # all the numbers; on grids (729-19652 numbers) one Adam epoch moves it by tens to
+    # hundreds, exp() overflowed (warp 16^3: NaN), and before that a single sample with
+    # a huge ratio and a negative advantage set the whole gradient.
+    DUAL_CLIP = 3.0
 
     def __init__(self, mu: torch.Tensor, cfg: ClassifyConfig):
         self.cfg = cfg
@@ -348,7 +353,7 @@ class GRPOPolicy:
         for _ in range(cfg.grpo_epochs):                   # 3. clipped surrogate + KL
             self.opt.zero_grad()
             d = self.dist()
-            ratio = (d.log_prob(theta).sum(-1) - old_logp).exp()
+            ratio = (d.log_prob(theta).sum(-1) - old_logp).clamp(max=np.log(self.DUAL_CLIP)).exp()
             surrogate = torch.min(ratio * A, ratio.clamp(1 - cfg.clip, 1 + cfg.clip) * A).mean()
             kl = torch.distributions.kl_divergence(d, self.ref).sum()
             (-surrogate + cfg.kl_coef * kl).backward()

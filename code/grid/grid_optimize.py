@@ -21,7 +21,12 @@ Methods (--method):
                 then the lowest RMS, is kept.
              2. Sampson fit (L-BFGS, no mesh): f(q)^2 / |grad f(q)|^2 + a small normal
                 term over G; for warp then over G and D together, from that result,
-                plus --disp-penalty * mean(D^2).
+                plus --disp-penalty * mean(D^2) and a sign term (--shell-weight) at
+                labelled points 0.25-1.5 cells off the target: y f >= d (d the distance
+                in cells, y = +1 outside). The Sampson loss only sees the target points,
+                and without the sign term D often made a small bubble of the wrong sign
+                0.5-1 cell off the surface, an extra surface piece that got the stage
+                rejected.
              3. chamfer refinement through marching cubes (Adam): mesh the grid, sample
                 the mesh, and minimise a two-sided chamfer distance measured to the
                 surfaces (mesh samples to the target points' tangent planes, target
@@ -101,7 +106,8 @@ class GridFitConfig:
     anchor_weights: tuple = (0.03, 0.3)   # stage 1: pulls towards the estimated signed distance (one fit each)
     sampson_iters: int = 100       # stage 2: L-BFGS iterations (0 = skip)
     disp_penalty: float = 1e-3     # warp: lambda * mean(D^2), D in cell units
-    iters: int = 300               # stage 3: Adam steps of the chamfer refinement
+    shell_weight: float = 1e-2     # warp stage 2: sign term at points off the target (see shell_points)
+    iters: int = 300              # stage 3: Adam steps of the chamfer refinement
     lr: float = 1e-3
     lr_final: float = 1e-5
     samples: int = 3000            # mesh / target samples per chamfer step
@@ -166,7 +172,26 @@ def fit_closed_form(grid: Grid, target: T.GridTarget, normal_weight=1.0, smooth_
 # ============================================================================
 # Stage 2: Sampson fit
 # ============================================================================
-def sampson_loss(model: GridModel, p, P, N, normal_weight=1e-3, disp_penalty=0.0):
+SHELL_CELLS = (0.25, 1.5)          # shell_points: offsets from the target, in cells
+SHELL_MARGIN = 1.0                  # sign term: y f >= SHELL_MARGIN * d (f is about the signed distance in cells)
+
+
+def shell_points(target: T.GridTarget, grid: Grid, n=6000, seed=0) -> tuple:
+    """(X, y, d): n points 0.25-1.5 cells off the target, on both sides (target points
+    moved along their normals), with the target's label y (+1 outside, -1 inside) and
+    distance d in cells. The labels and distances come from the target, not from the
+    offset, so points that cross a thin part of the shape are labelled correctly."""
+    gen = torch.Generator().manual_seed(seed)
+    P, N = target.points, target.normals
+    idx = torch.randint(len(P), (n,), generator=gen)
+    lo, hi = SHELL_CELLS
+    t = lo + (hi - lo) * torch.rand(n, dtype=DT, generator=gen)
+    t = torch.where(torch.rand(n, generator=gen) < 0.5, -t, t)
+    X = grid.clamp(P[idx] + N[idx] * (t * grid.h)[:, None])
+    return X, target.label(X), torch.as_tensor(target.distance(X), dtype=DT) / grid.h
+
+
+def sampson_loss(model: GridModel, p, P, N, normal_weight=1e-3, disp_penalty=0.0, shell=None, shell_weight=0.0):
     f = model.field(p, P)
     g = model.gradient(p, P)
     g2 = g.square().sum(-1).clamp_min(1e-12)
@@ -174,17 +199,24 @@ def sampson_loss(model: GridModel, p, P, N, normal_weight=1e-3, disp_penalty=0.0
     _, D = model.split(p)
     if D is not None and disp_penalty:
         loss = loss + disp_penalty * D.square().mean()
+    if shell is not None and shell_weight:
+        X, y, d = shell
+        loss = loss + shell_weight * torch.relu(SHELL_MARGIN * d - y * model.field(p, X)).square().mean()
     return loss
 
 
-def fit_sampson(model: GridModel, target: T.GridTarget, p0, iters=100, disp_penalty=1e-3, n_points=3000):
+def fit_sampson(model: GridModel, target: T.GridTarget, p0, iters=100, disp_penalty=1e-3, n_points=3000,
+                shell=None, shell_weight=0.0, tight=False):
+    """L-BFGS on sampson_loss. tight: run all iterations; with the default tolerances
+    L-BFGS can stop after one step, because the loss is only about 1e-5."""
     p = p0.clone().requires_grad_(True)
     P, N = target.points[:n_points], target.normals[:n_points]
-    opt = torch.optim.LBFGS([p], lr=1, max_iter=iters, history_size=30, line_search_fn="strong_wolfe")
+    tol = dict(tolerance_grad=1e-12, tolerance_change=1e-15) if tight else {}
+    opt = torch.optim.LBFGS([p], lr=1, max_iter=iters, history_size=30, line_search_fn="strong_wolfe", **tol)
 
     def closure():
         opt.zero_grad()
-        loss = sampson_loss(model, p, P, N, disp_penalty=disp_penalty)
+        loss = sampson_loss(model, p, P, N, disp_penalty=disp_penalty, shell=shell, shell_weight=shell_weight)
         loss.backward()
         return loss
     opt.step(closure)
@@ -430,7 +462,9 @@ def fit(model: GridModel, target: T.GridTarget, cfg: GridFitConfig, ccfg: C.Clas
             if improves(s2, s):
                 p, s = p2, s2
             if model.kind == "warp":
-                p3 = fit_sampson(model, target, p, cfg.sampson_iters, cfg.disp_penalty)
+                shell = shell_points(target, model.grid, seed=cfg.seed) if cfg.shell_weight else None
+                p3 = fit_sampson(model, target, p, cfg.sampson_iters, cfg.disp_penalty, shell=shell,
+                                 shell_weight=cfg.shell_weight, tight=True)
                 s3 = quick_check(model, p3, target, cfg.depth)
                 if verbose:
                     print(f"  2. Sampson fit, scalar        RMS {s[0]:.4e}, {s[1]} pieces")
@@ -601,6 +635,8 @@ def main():
     ap.add_argument("--samples", type=int, default=3000, help="target / mesh samples")
     ap.add_argument("--sampson-iters", type=int, default=100)
     ap.add_argument("--disp-penalty", type=float, default=1e-3, help="warp: lambda * mean(D^2)")
+    ap.add_argument("--shell-weight", type=float, default=1e-2,
+                    help="warp Sampson: weight of the sign term at points 0.25-1.5 cells off the target (0 = off)")
     ap.add_argument("--normal-weight", type=float, default=1.0)
     ap.add_argument("--smooth-weight", type=float, default=0.01)
     ap.add_argument("--anchor-weights", type=float, nargs="+", default=[0.03, 0.3],
@@ -620,7 +656,7 @@ def main():
     cfg = GridFitConfig(model=args.model, method=args.method, depth=args.depth, normal_weight=args.normal_weight,
                         smooth_weight=args.smooth_weight, anchor_weights=tuple(args.anchor_weights),
                         sampson_iters=args.sampson_iters,
-                        disp_penalty=args.disp_penalty, iters=args.iters, lr=args.lr, samples=args.samples,
+                        disp_penalty=args.disp_penalty, shell_weight=args.shell_weight, iters=args.iters, lr=args.lr, samples=args.samples,
                         seed=args.seed)
     grid, target = make_grid_and_target(args)
     model = GridModel(grid, args.model)
