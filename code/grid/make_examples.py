@@ -4,9 +4,10 @@ make_examples.py -- write the example point clouds (examples/point_clouds/*.xyz)
 the example functions (examples/functions/*.py).
 
 Each cloud has --points area-uniform points on the surface with unit outward normals,
-one per line:  x y z nx ny nz. Two extra variants test what the loader does with
-harder input:
-    torus_medium_no_normals.xyz   x y z only: the normals are estimated when loaded
+one per line:  x y z nx ny nz. The fits read only the positions; the normals are kept in
+the files for other tools. Two extra variants:
+    torus_medium_no_normals.xyz   x y z only (the same points as torus_medium.xyz, so it
+                                  now fits exactly like it)
     sphere_medium_noisy.xyz       points moved by Gaussian noise (std 0.005), no normals
 
 Usage (from the project folder):

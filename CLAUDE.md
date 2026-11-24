@@ -16,8 +16,8 @@ read the relevant section before changing a part of the code.
 - Run scripts from the project folder, e.g. `python code/grid/grid_optimize.py ...`.
   Each script puts `code/` on `sys.path` itself; modules import as packages
   (`from core.cube import Cube`, `from grid.grid import Grid`).
-- Tests: `python -m pytest code/tests -q` (52 tests, about 1 min);
-  `python code/tests/test_grid.py` for the grid only (about 25 s).
+- Tests: `python -m pytest code/tests -q` (55 tests, about 1 min);
+  `python code/tests/test_grid.py` for the grid only (about 30 s).
 - Python: use `.venv/bin/python` (or activate `.venv`); the `python` on PATH is miniconda
   without torch.
 - Outputs: single-cube fits go to `data/fits/`, grid fits to `data/fits/grid/`
@@ -43,13 +43,26 @@ read the relevant section before changing a part of the code.
   if it lowers the RMS without adding surface pieces.
 - ES and GRPO on grids use learning rate 0.01 (larger values flip signs of noisy
   vertices and create extra pieces); classification starts from the vertex labels.
-- Point-cloud distance: to the nearest point's tangent plane unless the offset along
-  the plane exceeds 4 point spacings (smaller limits overstate the error).
-- Warp Sampson stage (chamfer stage 2): sign term `--shell-weight 1e-2`, margin 1, at
-  points 0.25-1.5 cells off the target, and tight L-BFGS tolerances. Without it D makes
-  wrong-sign bubbles off the surface, the stage is rejected, and the fit depends on the
-  seed and machine (README, "The warp Sampson stage"). Refining from the rejected
-  result was tried and does not help.
+- No normals (2026-11-23, Tiberiu's choice): point clouds are positions only (normals in
+  files are ignored, none are estimated) and no stage uses normals, for functions
+  either. Function targets keep the exact distance `|g| / |grad g|` (and `sign g`) as
+  the reference the cloud fits are judged by (Tiberiu, 2026-11-23). Inside/outside of a cloud: `grid/inside_outside.py`, a 26-ray parity vote
+  (default, shell 3 point spacings) or a flood fill (shell 5; it leaks at 3). Distances
+  to a cloud are to the nearest point, also in the error report, which therefore has a
+  floor `sqrt(area / (2 pi N))` (printed as `rms_floor`). Do not bring back tangent
+  planes or normal estimation without asking.
+- Chamfer stages 1-2 use 6000 labelled points 0.25-1.5 cells off the target (random
+  directions, half inside, half outside): stage 1 fits `f = y d` there instead of
+  `h grad f = n`; stage 2 (scalar and warp Sampson) has the sign term
+  `--shell-weight 1e-2` on the first-order distance, `y f / (h |grad f|) >= d` (margin
+  1), and tight L-BFGS tolerances. Without the sign term the field makes wrong-sign
+  bubbles off the surface and the stage is rejected (README, "The warp Sampson stage");
+  on `f` itself (`y f >= d`) L-BFGS scaled G up to ~1e4 and made extra pieces (test
+  `test_scalar_sampson_keeps_the_scale`). Margins 0.5 and 0.25 broke on thin shapes.
+  Refining from a rejected result was tried and does not help.
+- Keep rule for point clouds: its RMS leaves out the floor (fit -> target counts only
+  beyond 3 point spacings, `KEEP_SPACINGS`); with the full point-to-point distance the
+  floor's sampling noise decided keep/reject.
 - GRPO: the importance ratio is capped at 3 (`GRPOPolicy.DUAL_CLIP`, dual-clip PPO).
   The log-ratio is a sum over all the numbers; uncapped, `exp` overflowed on warp 16^3
   grids (NaN) and single samples dominated the gradient (README, "The ratio cap").
@@ -63,10 +76,12 @@ read the relevant section before changing a part of the code.
 
 ## Open issues
 
-- The scalar Sampson step adds pieces and is rejected for most shapes; the sign term
-  (above) is not used there yet. Tight tolerances alone already help one case (torus
-  medium cloud 16^3: L-BFGS stopped after one step). Changing it changes the scalar
-  columns of the README tables.
+- Without normals the fits are 1.0-1.24x the error of the fits with normals (geometric
+  means per setup, README "Without normals"); worst are the spheres at scalar 8^3
+  (1.25-1.47x) and the small sphere and ellipsoid at warp 16^3 (1.55-1.63x). The sign
+  term's margin 1 bends small curved shapes; smaller margins made extra pieces.
+- Logistic / ES / GRPO on grids were not rerun since the change to no normals (their
+  labels now come from inside_outside.py); the README grid GRPO numbers are older.
 - The keep rule counts pieces at depth 2, the final report at depth 3; small pieces
   can show only at depth 3.
 - GRPO steps far outside the PPO trust region: approximate KL 0.3-0.5 after one
@@ -74,4 +89,4 @@ read the relevant section before changing a part of the code.
   learning rate that shrinks with the number of values is untested; either would also
   change the single-cube results.
 - The fits in `data/fits/grid` and its overview images are from before the sign term
-  (2026-11-22); the README warp columns are newer.
+  (2026-11-22) and use normals; the README tables are newer (2026-11-23, no normals).

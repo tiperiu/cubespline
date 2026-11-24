@@ -191,11 +191,11 @@ def test_examples_load():
         assert g.shape == (len(X),) and (g < 0).any() and (g > 0).any(), name
         assert isinstance(title, str) and title
     assert len(ex["point_clouds"]) >= len(ex["functions"])
-    t = T.load_target(grid, points="torus_medium_no_normals", n=500)
-    assert t.normals_estimated and len(t.points) == 500
+    t = T.load_target(grid, points="torus_medium", n=500)
+    assert len(t.points) == 500 and t.inside is not None and t.inside.inside_voxels > 0
 
 
-def test_point_cloud_files_and_normal_estimation():
+def test_point_cloud_files_give_positions_only():
     fn = _sphere()
     P, N = T.function_samples(fn, Grid.cube(1), 3000, 0)[:2]
     with tempfile.TemporaryDirectory() as d:
@@ -205,11 +205,9 @@ def test_point_cloud_files_and_normal_estimation():
         np.savetxt(without, P, delimiter=",")
         npy = os.path.join(d, "c.npy")
         np.save(npy, P)
-        P1, N1 = T.load_point_cloud(with_n)
-        assert np.allclose(P1, P) and np.allclose(N1, N)
-        for path in (without, npy):
-            P2, N2 = T.load_point_cloud(path)
-            assert np.allclose(P2, P) and N2 is None
+        for path in (with_n, without, npy):                  # the normals in a.xyz are ignored
+            P2 = T.load_point_cloud(path)
+            assert P2.shape == P.shape and np.allclose(P2, P), path
         props = "".join(f"property float {c}\n" for c in ("x", "y", "z", "nx", "ny", "nz"))
         head = f"ply\nformat {{}} 1.0\nelement vertex {len(P)}\n{props}element face 0\n" \
                "property list uchar int vertex_indices\nend_header\n"
@@ -225,11 +223,8 @@ def test_point_cloud_files_and_normal_estimation():
             fh.writelines(f"v {x} {y} {z}\n" for x, y, z in P)
             fh.writelines(f"vn {x} {y} {z}\n" for x, y, z in N)
         for path in (ply_bin, ply_txt, obj):
-            P3, N3 = T.load_point_cloud(path)
-            assert np.allclose(P3, P, atol=1e-6) and np.allclose(N3, N, atol=1e-6), path
-    Ne = T.estimate_normals(P)
-    cos = (Ne * N).sum(1)
-    assert (cos > 0).all() and np.median(cos) > 0.999          # oriented outward, no flips
+            P3 = T.load_point_cloud(path)
+            assert P3.shape == P.shape and np.allclose(P3, P, atol=1e-6), path
 
 
 def test_labels_and_distances():
@@ -240,12 +235,53 @@ def test_labels_and_distances():
     tf = T.target_from_function(fn, "sphere", grid, n=1000)
     assert np.array_equal(tf.label(X).numpy(), truth)
     assert np.allclose(tf.distance(X), np.abs(fn(X.numpy())), atol=1e-6)
-    P, N = T.function_samples(fn, grid, 5000, 1)[:2]
-    tp = T.target_from_points(P, None, "sphere cloud", grid, n=1000)
-    assert (tp.label(X).numpy() == truth).mean() > 0.99
-    near = np.abs(fn(X.numpy())) < 0.1
-    e = np.abs(tp.distance(X)[near] - np.abs(fn(X.numpy()))[near])
-    assert np.median(e) < 0.003 and e.max() < 3 * tp.spacing()   # gaps between random samples
+    P = T.function_samples(fn, grid, 5000, 1)[0]
+    for inside in ("rays", "flood"):
+        tp = T.target_from_points(P, "sphere cloud", grid, n=1000, inside=inside)
+        assert (tp.label(X).numpy() == truth).mean() > 0.99, inside
+    # to the nearest point: never closer than the surface, at most a gap between samples further
+    g = np.abs(fn(X.numpy()))
+    e = tp.distance(X) - g
+    assert e.min() > -1e-9 and np.median(e[g < 0.1]) < tp.spacing(), (e.min(), np.median(e[g < 0.1]))
+
+
+def _labels_against_truth(name, inside, n=20000):
+    """(accuracy of the cloud's inside/outside, accuracy beyond 3 point spacings) on
+    points near the example cloud and uniform in [-1, 1]^3, against its function."""
+    grid = Grid.cube(8)
+    fn, _ = T.load_function(T.resolve_function(name))
+    tp = T.target_from_points(T.load_point_cloud(T.resolve_points(name)), name, grid, inside=inside)
+    gen = torch.Generator().manual_seed(3)
+    P = torch.as_tensor(tp.cloud, dtype=DT)
+    X = grid.clamp(torch.cat([P[torch.randint(len(P), (n // 2,), generator=gen)]
+                              + 0.1 * torch.randn(n // 2, 3, dtype=DT, generator=gen), grid.uniform(n // 2, gen)]))
+    g = fn(X.numpy())
+    ok = tp.label(X).numpy() == np.where(g > 0, 1.0, -1.0)
+    dist = np.abs(g) / np.maximum(np.linalg.norm(T.O._fn_gradient(fn, X.numpy()), axis=-1), 1e-12)
+    return ok.mean(), ok[dist > 3 * tp.spacing()].mean()
+
+
+def test_inside_outside_without_normals():
+    # the torus has a hole and a tube 0.24 thick (about 30 point spacings of its cloud)
+    for inside in ("rays", "flood"):
+        acc, far = _labels_against_truth("torus_small", inside)
+        assert acc > 0.99 and far > 0.999, (inside, acc, far)
+
+
+def test_ray_vote_copes_with_a_hole():
+    # a sphere cloud with a cap cut off (an opening 0.5 wide, far wider than the shell):
+    # the flood fill leaks in, the ray vote still finds the inside
+    fn = _sphere(c=(0, 0, 0), r=0.55)
+    P = T.function_samples(fn, Grid.cube(1), 5000, 4)[0]
+    P = P[P[:, 2] < 0.5]
+    centre = torch.zeros(1, 3, dtype=DT)
+    rays = T.target_from_points(P, "open sphere", Grid.cube(8), inside="rays")
+    assert rays.label(centre).item() == -1
+    X = torch.as_tensor(RNG.uniform(-0.4, 0.4, (2000, 3)), dtype=DT)
+    X = X[X.norm(dim=-1) < 0.4]                              # well inside, below the opening too
+    assert (rays.label(X) == -1).double().mean() > 0.97
+    flood = T.target_from_points(P, "open sphere", Grid.cube(8), inside="flood")
+    assert flood.inside.inside_voxels < 0.01 * rays.inside.inside_voxels
 
 
 # ----------------------------------------------------------------------------- optimizers
@@ -266,12 +302,15 @@ def test_chamfer_fit_of_a_sphere():
 
 def test_chamfer_fit_of_a_point_cloud():
     grid = Grid.cube(6)
-    P, _ = T.function_samples(_sphere(), grid, 4000, 2)[:2]
-    target = T.target_from_points(P, None, "sphere cloud", grid, n=2000)
+    P = T.function_samples(_sphere(), grid, 4000, 2)[0]
+    target = T.target_from_points(P, "sphere cloud", grid, n=2000)
     model = GridModel(grid, "scalar")
     p, _ = GO.fit(model, target, _quick_cfg("scalar"), verbose=False)
     err = GO.evaluate(model, p, target, depth=2, n=4000)
-    assert err["surface_pieces"] == 1 and err["rms_in_cells"] < 0.08, err
+    # the RMS is to the nearest point, so a perfect surface already measures rms_floor
+    assert err["surface_pieces"] == 1 and err["rms"] < 1.25 * err["rms_floor"], err
+    exact = GO.evaluate(model, p, T.target_from_function(_sphere(), "sphere", grid, n=2000), depth=2, n=4000)
+    assert exact["rms_in_cells"] < 0.05, exact["rms_in_cells"]
 
 
 def test_logistic_classification_on_the_grid():
@@ -300,16 +339,32 @@ def test_shell_points_are_off_the_target_and_labelled():
 
 def test_warp_sampson_has_no_bubble():
     # ellipsoid_flat cloud, 8^3, seed 5: without the sign term the warp Sampson fit had a
-    # 4-face bubble 1.2 cells off the surface and was rejected (RMS stayed 2.7x higher)
+    # 4-face bubble 1.2 cells off the surface and was rejected
     grid = Grid.cube(8)
-    P, N = T.load_point_cloud(T.resolve_points("ellipsoid_flat"))
-    target = T.target_from_points(P, N, "ellipsoid_flat", grid, n=3000, seed=5)
+    target = T.target_from_points(T.load_point_cloud(T.resolve_points("ellipsoid_flat")), "ellipsoid_flat", grid,
+                                  n=3000, seed=5)
     model = GridModel(grid, "warp")
     p, info = GO.fit(model, target, GO.GridFitConfig(model="warp", seed=5, iters=0), verbose=False)
     stages = dict((s[0], s[1]) for s in info["stages"])
-    assert stages["sampson"] < 0.5 * stages["closed form"], stages     # the warp stage was kept
+    assert stages["sampson"] < stages["closed form"], stages          # the Sampson stage was kept
     for depth in (2, 3):
         assert count_pieces(extract_topology(model, p, depth).F) == 1, depth
+
+
+def test_scalar_sampson_keeps_the_scale():
+    # torus_large_thin cloud, 8^3: with the sign term on f itself (y f >= d) L-BFGS met it
+    # by scaling G up to |G| ~ 15000, and the field made 37 surface pieces. On the
+    # first-order distance f / (h |grad f|) the term is scale-free and the stage is kept.
+    grid = Grid.cube(8)
+    target = T.target_from_points(T.load_point_cloud(T.resolve_points("torus_large_thin")), "torus_large_thin",
+                                  grid, n=3000)
+    model = GridModel(grid, "scalar")
+    shell = GO.shell_points(target, grid)
+    G = GO.fit_closed_form(grid, target, shell, anchor_weight=0.03)
+    G2 = GO.fit_sampson(model, target, G, 100, shell=shell, shell_weight=1e-2, tight=True)
+    assert G2.abs().max() < 2 * G.abs().max(), (G.abs().max(), G2.abs().max())
+    s1, s2 = GO.quick_check(model, G, target, 2), GO.quick_check(model, G2, target, 2)
+    assert GO.improves(s2, s1) and s2[1] == 1, (s1, s2)
 
 
 def test_grpo_stays_finite_with_many_numbers():

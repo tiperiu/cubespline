@@ -8,27 +8,26 @@ Function file (e.g. examples/functions/sphere_medium.py):
     negative inside, positive outside, zero on the surface. Optional: NAME = "...".
 
 Point cloud file:
-    .xyz / .txt / .csv / .pts   one point per line: x y z [nx ny nz]  (space or comma separated)
-    .npy                        array (N, 3) or (N, 6)
-    .ply                        vertices with x y z [nx ny nz] (ascii or binary little endian)
-    .obj                        "v" lines, and "vn" lines if there is one per vertex
-    Normals are optional. Without them they are estimated (PCA of the 16 nearest
-    neighbours, oriented consistently by propagation over the neighbour graph, and
-    outward at the extreme point of each connected piece).
+    .xyz / .txt / .csv / .pts   one point per line: x y z [more columns]  (space or comma separated)
+    .npy                        array (N, 3) or wider
+    .ply                        vertices with x y z (ascii or binary little endian)
+    .obj                        "v" lines
+    Only the positions are read. Normals (or anything else) in the file are ignored.
 
 Both kinds provide the same interface to the optimizers:
-    points, normals   (n, 3) samples on the surface (torch), unit outward normals
-    label(X)          +1 outside, -1 inside: sign of g, or for a point cloud the side of
-                      the nearest point's tangent plane, sign((x - p) . n)
-    distance(X)       |g| / |grad g| (first-order distance); for a point cloud the distance
-                      to the tangent plane of the nearest point (no sampling floor), or to
-                      the point itself when that is more than two point spacings away
+    points            (n, 3) samples on the surface (torch)
+    cloud             (N, 3) all surface points in the domain (numpy); 20000 samples for a function
+    label(X)          +1 outside, -1 inside: the sign of g, or for a point cloud the
+                      inside/outside test of inside_outside.py (positions only: a vote of
+                      rays, or a flood fill)
+    distance(X)       |g| / |grad g| (first-order distance) for a function; for a point cloud
+                      the distance to the nearest point. That has a floor: a perfect surface
+                      is about sqrt(area / (pi N)) RMS from N random points on it.
     dense(n)          many surface points for the final error evaluation
 """
 
 from __future__ import annotations
 
-import heapq
 import importlib.util
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,7 +39,9 @@ import optimization.optimize as O
 from core.box import Box
 from core.paths import EXAMPLES
 from grid.grid import DT, Grid
+from grid.inside_outside import InsideOutside
 
+INSIDE_RADIUS = {"rays": 3.0, "flood": 5.0}   # shell radius of the inside/outside test, in point spacings
 FUNCTION_DIR = EXAMPLES / "functions"
 POINTS_DIR = EXAMPLES / "point_clouds"
 POINT_EXTS = (".xyz", ".txt", ".csv", ".pts", ".npy", ".ply", ".obj")
@@ -54,51 +55,46 @@ class GridTarget:
     name: str
     kind: str                         # "function" | "points"
     points: torch.Tensor              # (n, 3) surface samples used by the optimizers
-    normals: torch.Tensor             # (n, 3) unit outward normals
     cloud: np.ndarray                 # (N, 3) all surface points in the domain (display, evaluation)
-    cloud_normals: np.ndarray
     fn: object = None                 # g(X) for function targets
     V: np.ndarray | None = None       # display mesh of a function target (clipped to the domain)
     F: np.ndarray | None = None
     source: str | None = None         # file it came from
-    normals_estimated: bool = False
+    inside: InsideOutside | None = None   # point clouds: the inside/outside test
     grid: Grid | None = None
     _cloud_t: torch.Tensor | None = field(default=None, repr=False)
+
+    def cloud_tensor(self) -> torch.Tensor:
+        if self._cloud_t is None:
+            self._cloud_t = torch.as_tensor(self.cloud, dtype=DT)
+        return self._cloud_t
 
     def label(self, X: torch.Tensor) -> torch.Tensor:
         """+1 outside, -1 inside (0 counts as outside)."""
         if self.fn is not None:
             g = self.fn(X.detach().numpy())
             return torch.as_tensor(np.where(g > 0, 1.0, -1.0), dtype=DT)
-        if self._cloud_t is None:
-            self._cloud_t = torch.as_tensor(self.cloud, dtype=DT)
-        idx = O.nearest(X, self._cloud_t)
-        side = ((X - self._cloud_t[idx]) * torch.as_tensor(self.cloud_normals, dtype=DT)[idx]).sum(-1)
-        return torch.where(side >= 0, 1.0, -1.0).to(DT)
+        return self.inside.label(X)
 
     def distance(self, X: torch.Tensor) -> np.ndarray:
+        """Distance to the target: first order for a function, to the nearest point for a cloud."""
         if self.fn is not None:
             Xn = X.detach().numpy()
             G = O._fn_gradient(self.fn, Xn)
             return np.abs(self.fn(Xn)) / np.maximum(np.linalg.norm(G, axis=-1), 1e-12)
-        if self._cloud_t is None:
-            self._cloud_t = torch.as_tensor(self.cloud, dtype=DT)
-        # distance to the nearest point's tangent plane, unless x is far from that point
-        # along the plane (beyond the edge of an open cloud): then to the point itself.
-        # The limit is 4 point spacings, because random samples leave gaps: with 2
-        # spacings, 6 % of the points of a perfect surface fell in a gap and doubled the RMS.
-        idx = O.nearest(X, self._cloud_t)
-        diff = (X - self._cloud_t[idx]).detach()
-        d_point = diff.norm(dim=-1).numpy()
-        d_plane = np.abs((diff * torch.as_tensor(self.cloud_normals, dtype=DT)[idx]).sum(-1).numpy())
-        along = np.sqrt(np.maximum(d_point ** 2 - d_plane ** 2, 0))
-        return np.where(along < 4 * self.spacing(), d_plane, d_point)
+        return self.cloud_distance(X).numpy()
+
+    def cloud_distance(self, X: torch.Tensor) -> torch.Tensor:
+        """Distance from X to the nearest point of the cloud (differentiable in X)."""
+        C = self.cloud_tensor()
+        with torch.no_grad():
+            idx = O.nearest(X, C)
+        return (X - C[idx]).norm(dim=-1)
 
     def spacing(self) -> float:
         """Median distance between neighbouring cloud points."""
         if not hasattr(self, "_spacing"):
-            sub = self.cloud[np.random.default_rng(0).choice(len(self.cloud), min(2000, len(self.cloud)), False)]
-            self._spacing = float(np.median(np.linalg.norm(sub - self.cloud[knn_to(sub, self.cloud)], axis=1)))
+            self._spacing = cloud_spacing(self.cloud)
         return self._spacing
 
     def dense(self, n=20000, seed=123) -> np.ndarray:
@@ -113,8 +109,7 @@ class GridTarget:
     def describe(self) -> str:
         if self.kind == "function":
             return f"function '{self.name}'" + (f" ({self.source})" if self.source else "")
-        est = ", normals estimated" if self.normals_estimated else ""
-        return f"point cloud '{self.name}', {len(self.cloud)} points in the grid{est}"
+        return f"point cloud '{self.name}', {len(self.cloud)} points in the grid; {self.inside.describe()}"
 
 
 # ============================================================================
@@ -155,12 +150,12 @@ def function_samples(fn, grid: Grid, n: int, seed: int = 0):
 
 
 def target_from_function(fn, name, grid: Grid, n=4000, seed=0, source=None) -> GridTarget:
-    P, N, V, F = function_samples(fn, grid, n, seed)
+    P, _, V, F = function_samples(fn, grid, n, seed)
     if len(P) < 50:
         raise ValueError(f"target '{name}' has (almost) no surface inside the grid")
-    cloud, cloud_n = function_samples(fn, grid, 20000, seed + 1)[:2]
-    return GridTarget(name, "function", torch.as_tensor(P, dtype=DT), torch.as_tensor(N, dtype=DT),
-                      cloud, cloud_n, fn=fn, V=V, F=F, source=source, grid=grid)
+    cloud = function_samples(fn, grid, 20000, seed + 1)[0]
+    return GridTarget(name, "function", torch.as_tensor(P, dtype=DT), cloud, fn=fn, V=V, F=F, source=source,
+                      grid=grid)
 
 
 # ============================================================================
@@ -200,13 +195,11 @@ def _read_ply(path):
             rec = np.frombuffer(fh.read(dt.itemsize * count), dtype=dt, count=count)
             A = np.stack([rec[nm].astype(float) for nm in names], 1)
     col = {nm: i for i, nm in enumerate(names)}
-    P = A[:, [col["x"], col["y"], col["z"]]]
-    N = A[:, [col["nx"], col["ny"], col["nz"]]] if all(k in col for k in ("nx", "ny", "nz")) else None
-    return P, N
+    return A[:, [col["x"], col["y"], col["z"]]]
 
 
-def load_point_cloud(path) -> tuple:
-    """(points (N, 3), normals (N, 3) or None)."""
+def load_point_cloud(path) -> np.ndarray:
+    """The positions (N, 3) of a point cloud file; other columns (normals, colours) are ignored."""
     path = Path(path)
     ext = path.suffix.lower()
     if ext == ".npy":
@@ -214,16 +207,9 @@ def load_point_cloud(path) -> tuple:
     elif ext == ".ply":
         return _read_ply(path)
     elif ext == ".obj":
-        V, VN = [], []
         with open(path) as fh:
-            for line in fh:
-                parts = line.split()
-                if parts[:1] == ["v"]:
-                    V.append([float(x) for x in parts[1:4]])
-                elif parts[:1] == ["vn"]:
-                    VN.append([float(x) for x in parts[1:4]])
-        P = np.array(V, float)
-        return P, (np.array(VN, float) if len(VN) == len(V) and len(V) else None)
+            V = [[float(x) for x in line.split()[1:4]] for line in fh if line.split()[:1] == ["v"]]
+        return np.array(V, float).reshape(-1, 3)
     else:
         with open(path) as fh:
             text = fh.read()
@@ -232,17 +218,8 @@ def load_point_cloud(path) -> tuple:
         A = A[~np.isnan(A).any(1)] if A.ndim == 2 else A[None]
     A = np.asarray(A, float)
     if A.ndim != 2 or A.shape[1] < 3:
-        raise ValueError(f"{path}: expected N x 3 or N x 6 numbers")
-    return A[:, :3], (A[:, 3:6] if A.shape[1] >= 6 else None)
-
-
-def knn(P: np.ndarray, k: int) -> np.ndarray:
-    """Indices (N, k) of the k nearest other points."""
-    T = torch.as_tensor(P, dtype=torch.float32)
-    out = []
-    for i in range(0, len(T), 4096):
-        out.append(torch.cdist(T[i:i + 4096], T).topk(k + 1, largest=False).indices[:, 1:])
-    return torch.cat(out).numpy()
+        raise ValueError(f"{path}: expected N x 3 numbers (or more columns)")
+    return A[:, :3]
 
 
 def knn_to(X: np.ndarray, P: np.ndarray) -> np.ndarray:
@@ -251,52 +228,31 @@ def knn_to(X: np.ndarray, P: np.ndarray) -> np.ndarray:
     return d.topk(2, largest=False).indices[:, 1].numpy()
 
 
-def estimate_normals(P: np.ndarray, k: int = 16) -> np.ndarray:
-    """Unit normals by PCA of the k nearest neighbours, oriented consistently (Hoppe et
-    al. 1992: propagate along the neighbour graph, most parallel neighbours first) and
-    outward at the extreme (largest x) point of each connected piece."""
+def cloud_spacing(P: np.ndarray) -> float:
+    """Median distance between neighbouring points (of up to 2000 of them)."""
     P = np.asarray(P, float)
-    nb = knn(P, k)
-    Q = P[nb] - P[nb].mean(1, keepdims=True)
-    C = np.einsum("nki,nkj->nij", Q, Q)
-    _, vec = np.linalg.eigh(C)
-    N = vec[:, :, 0].copy()
-    done = np.zeros(len(P), bool)
-    order = np.argsort(-P[:, 0])                     # seeds: largest x first
-    for seed in order:
-        if done[seed]:
-            continue
-        if N[seed, 0] < 0:                            # outward at the extreme point
-            N[seed] *= -1
-        done[seed] = True
-        heap = [(1 - abs(float(N[seed] @ N[j])), int(j), int(seed)) for j in nb[seed] if not done[j]]
-        heapq.heapify(heap)
-        while heap:
-            _, j, i = heapq.heappop(heap)
-            if done[j]:
-                continue
-            if N[j] @ N[i] < 0:
-                N[j] *= -1
-            done[j] = True
-            for m in nb[j]:
-                if not done[m]:
-                    heapq.heappush(heap, (1 - abs(float(N[j] @ N[m])), int(m), int(j)))
-    return N
+    sub = P[np.random.default_rng(0).choice(len(P), min(2000, len(P)), False)]
+    return float(np.median(np.linalg.norm(sub - P[knn_to(sub, P)], axis=1)))
 
 
-def target_from_points(P, N, name, grid: Grid, n=4000, seed=0, source=None) -> GridTarget:
+def target_from_points(P, name, grid: Grid, n=4000, seed=0, source=None, inside="rays",
+                       inside_radius=None) -> GridTarget:
+    """A point cloud target from positions only. The inside/outside test is built from the
+    whole cloud (also the points outside the grid), over the cloud and the grid domain."""
     P = np.asarray(P, float)
-    estimated = N is None
-    N = estimate_normals(P) if estimated else np.asarray(N, float)
-    N = N / np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-12)
+    radius = INSIDE_RADIUS[inside] if inside_radius is None else inside_radius
+    io = InsideOutside(P, cloud_spacing(P), inside, radius, grid.lo_np, grid.hi_np)
+    if io.inside_voxels == 0:
+        print(f"  warning: the inside/outside test ({inside}) found no inside in '{name}': the cloud may have "
+              f"holes wider than the shell (radius {radius:g} point spacings) or be open; try a larger "
+              f"--inside-radius" + (" or --inside rays" if inside == "flood" else ""))
     keep = grid.contains(P)
     if keep.sum() < 50:
         raise ValueError(f"point cloud '{name}' has (almost) no points inside the grid")
-    P, N = P[keep], N[keep]
+    P = P[keep]
     rng = np.random.default_rng(seed)
     sel = rng.choice(len(P), min(n, len(P)), replace=False)
-    return GridTarget(name, "points", torch.as_tensor(P[sel], dtype=DT), torch.as_tensor(N[sel], dtype=DT),
-                      P, N, source=source, normals_estimated=estimated, grid=grid)
+    return GridTarget(name, "points", torch.as_tensor(P[sel], dtype=DT), P, source=source, inside=io, grid=grid)
 
 
 # ============================================================================
@@ -328,7 +284,8 @@ def resolve_points(spec: str) -> Path:
     raise FileNotFoundError(f"no point cloud '{spec}' (examples: {', '.join(list_examples()['point_clouds'])})")
 
 
-def load_target(grid: Grid, function: str | None = None, points: str | None = None, n=4000, seed=0) -> GridTarget:
+def load_target(grid: Grid, function: str | None = None, points: str | None = None, n=4000, seed=0,
+                inside="rays", inside_radius=None) -> GridTarget:
     """The target from a function file or a point cloud file (paths or example names)."""
     if (function is None) == (points is None):
         raise ValueError("give exactly one of a function file or a point cloud file")
@@ -337,8 +294,8 @@ def load_target(grid: Grid, function: str | None = None, points: str | None = No
         fn, name = load_function(path)
         return target_from_function(fn, name, grid, n=n, seed=seed, source=str(path))
     path = resolve_points(points)
-    P, N = load_point_cloud(path)
-    return target_from_points(P, N, path.stem, grid, n=n, seed=seed, source=str(path))
+    return target_from_points(load_point_cloud(path), path.stem, grid, n=n, seed=seed, source=str(path),
+                              inside=inside, inside_radius=inside_radius)
 
 
 def default_grid(dims, target_bounds=None, lo=None, size=None) -> Grid:

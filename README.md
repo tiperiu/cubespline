@@ -37,7 +37,8 @@ cubespline/
 | `code/optimization/classify_optimize.py` | fit the cube by inside/outside classification: logistic loss + Adam, evolution strategies, or GRPO (reward only); the grid optimizer reuses it |
 | `code/grid/grid.py` | `Grid` (cells, vertex ids, interpolation) and `GridModel`: `scalar` (a value per vertex) or `warp` (a value and a 3D displacement per vertex) |
 | `code/grid/grid_marching.py` | marching cubes over the whole grid, differentiable vertices, watertightness check |
-| `code/grid/targets.py` | grid targets: function files `g(X)` and point clouds (.xyz, .ply, .obj, …), normal estimation, inside/outside labels, distances |
+| `code/grid/targets.py` | grid targets: function files `g(X)` and point clouds (.xyz, .ply, .obj, …; positions only), inside/outside labels, distances |
+| `code/grid/inside_outside.py` | inside/outside of a point cloud without normals: a vote of 26 rays, or a flood fill |
 | `code/grid/grid_optimize.py` | fit a grid to a target: chamfer (closed form → Sampson → chamfer through marching cubes), logistic, ES, GRPO |
 | `code/grid/fit_examples.py` | fit every example, save the fits and print a results table |
 | `code/grid/make_examples.py` | write the example point clouds from the example functions |
@@ -62,9 +63,9 @@ the fit files of the folder they are started from and of those folders, and
 cd cubespline
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest code/tests -q                         # all tests (52), about 1 min
+python -m pytest code/tests -q                         # all tests (55), about 1 min
 python code/tests/test_cubespline.py                   # or one file at a time
-python code/tests/test_grid.py                         # only the grid tests (21), about 25 s
+python code/tests/test_grid.py                         # only the grid tests (24), about 30 s
 ```
 
 ## Use
@@ -474,19 +475,45 @@ example (below) works as well as a path.
 
   It is meshed on a fine lattice over the domain, sampled area-uniformly, and the
   samples are projected onto `g = 0`, as for the single cube.
-* **Point cloud**: `.xyz`, `.txt`, `.csv`, `.pts` (columns `x y z [nx ny nz]`),
-  `.npy`, `.ply` (ASCII or binary) or `.obj` (vertices and vertex normals). Without
-  normals they are estimated: PCA over the 16 nearest neighbours, oriented
-  consistently by propagating over the neighbour graph, and outward at the point of
-  largest x of each piece.
-* **Inside/outside** (for the classification methods): the sign of `g`, or for a
-  cloud the side of the nearest point's tangent plane.
-* **Distances** (for the errors): `|g| / |∇g|`, or for a cloud the distance to the
-  nearest point's tangent plane, unless the offset along that plane is more than 4
-  point spacings (beyond the edge of an open cloud), then to the point itself. A fit
-  from the sphere cloud measures the same against the cloud as against the exact
-  sphere (2.9e-3). With a 2-spacing limit it measured 6.4e-3: 6 % of the points of a
-  perfect surface fall in a gap between random samples that wide.
+* **Point cloud**: `.xyz`, `.txt`, `.csv`, `.pts` (columns `x y z`, more columns
+  are ignored), `.npy`, `.ply` (ASCII or binary) or `.obj` (`v` lines). **Only the
+  positions are used**: normals in the file are ignored, and none are estimated.
+* **Inside/outside** (the start, the sign terms and the classification labels): the
+  sign of `g`, or for a cloud the test of `inside_outside.py` (`--inside`, below).
+* **Distances**: `|g| / |∇g|`, or for a cloud the distance to the nearest point.
+  That has a floor: a perfect surface is on average `sqrt(area / (π N))` from the
+  nearest of `N` random points on it, so the two-sided RMS of a perfect surface is
+  `sqrt(area / (2π N))`, which the report prints as the floor. For the 5000-point
+  examples it is 7e-3 to 1.6e-2, more than the shape error of most fits.
+
+**Inside/outside without normals** (`inside_outside.py`). Both tests work on a voxel
+grid around the cloud (voxels half a point spacing, at most 192 per axis):
+
+1. The **shell**: the voxels within `r` of a point (`--inside-radius`, in point
+   spacings). Where the gaps between points are narrower than `2r`, the shell is
+   closed.
+2. The voxels off the shell are labelled:
+   * `rays` (default, `r` = 3 spacings): 26 rays along the lattice directions (axes,
+     face and body diagonals); a ray that enters the shell an odd number of times
+     before it leaves the grid votes inside, and the votes are averaged over each
+     3×3×3 block of free voxels before the majority is taken (rays that graze the
+     shell flip a few votes next to it). A hole in the cloud misleads only the rays
+     that pass through it.
+   * `flood` (`r` = 5 spacings): outside if connected to the border of the voxel grid.
+     Exact for a closed shell, but a hole wider than `2r` lets the outside in. Random
+     samples leave gaps of several spacings: with `r` = 3 the flood leaked into the
+     medium sphere and the small torus.
+3. The shell voxels take the side that is nearer (the two regions grow into the shell
+   one voxel per step), so the sign changes half-way through the shell, on the cloud;
+   `label(x)` is the sign of that field, interpolated trilinearly.
+
+Against the exact inside/outside of the 11 example clouds (points near the surface
+as the classifiers draw them, plus 25 % uniform): rays 99.2–99.7 % correct, flood
+98.7–99.6 %, and both 100 % beyond 0.02 from the surface. The errors are within about
+a point spacing of the surface: within 0.005 of it rays is 77–90 % correct and flood
+67–87 %, where the tangent planes of the previous estimated normals got 93–99 % (66 %
+on the noisy cloud). Each test takes 1–4 s. A part thinner than `2r` is lost (it is
+all shell), and an open cloud has no inside (the fit then warns).
 
 **The grid domain.** For a function, `[-1, 1]³` or `--lo X Y Z --size S`. For a
 point cloud, `[-1, 1]³` if the cloud lies inside it, otherwise its bounding box plus
@@ -496,8 +523,8 @@ the cells per axis; cells are always cubes.
 ### Examples (`examples/`)
 
 Nine functions in `examples/functions/`, and the same shapes as point clouds in
-`examples/point_clouds/` (5000 points each, with normals, written by
-`make_examples.py`), all inside `[-1, 1]³`:
+`examples/point_clouds/` (5000 points each, written by `make_examples.py` with normals,
+which the fits ignore), all inside `[-1, 1]³`:
 
 | examples | sizes |
 |---|---|
@@ -505,35 +532,38 @@ Nine functions in `examples/functions/`, and the same shapes as point clouds in
 | `ellipsoid_small`, `ellipsoid_flat`, `ellipsoid_long` | semi-axes (0.4, 0.25, 0.18), (0.8, 0.5, 0.25), (0.85, 0.3, 0.3); the small and long ones rotated |
 | `torus_small`, `torus_medium`, `torus_large_thin` | major / tube radius 0.35 / 0.12, 0.55 / 0.2, 0.75 / 0.12; the small and thin ones rotated |
 
-Two more point clouds test harder input: `torus_medium_no_normals` (positions only,
-the normals are estimated) and `sphere_medium_noisy` (Gaussian noise of std 0.005,
-no normals).
+Two more point clouds: `sphere_medium_noisy` (Gaussian noise of std 0.005) and
+`torus_medium_no_normals` (the points of `torus_medium` without the normal columns;
+since normals are no longer read, it fits exactly like `torus_medium`).
 
 ### Fitting (`grid_optimize.py`)
 
-`--method chamfer` (default) has three stages:
+`--method chamfer` (default) has three stages. **No stage uses normals**: the target
+is its points, the inside/outside label `y` (+1 outside, −1 inside) and the distance
+`d` to the target. Stages 1 and 2 share 6000 **labelled points** 0.25–1.5 cells off the
+target: target points moved by up to 1.8 cells in random directions, kept if their
+distance to the target is in range, half of them outside and half inside (random
+moves from a convex surface end up outside about twice as often).
 
-1. **Closed-form start** for `G`: least squares on `f(q) = 0` and `h ∇f(q) = n` at
-   the target points `(q, n)`, a small smoothness term (second differences of `G`),
-   and a pull of every vertex towards its estimated signed distance (distance to the
-   nearest target point, with the target's inside/outside sign). The pull keeps the
-   vertices far from the target well defined. It is solved for each weight in
-   `--anchor-weights` (0.03 and 0.3), and the result with the fewest surface pieces,
-   then the lowest RMS, is kept. 0.03 is best for shapes several cells thick, 0.3 for
-   thin ones: on the small ellipsoid (0.36 thick, 1.4 cells) 0.03 gave 3 pieces at
-   RMS 6e-2, 0.3 one piece at 2.2e-2.
-2. **Sampson fit** (L-BFGS, no mesh) of `f(q)² / |∇f(q)|²`: the scalar grid first,
-   then for the warp model `G` and `D` together, plus `--disp-penalty · mean(D²)` and
-   a **sign term** `--shell-weight · mean(relu(d − y f)²)` at 6000 points 0.25–1.5
-   cells off the target, on both sides (`y` the target's inside/outside label, `d` the
-   distance to the target in cells; `f` is about the signed distance in cells). The
-   Sampson loss only sees the target points, and without the sign term `D` often made
-   a small bubble of the wrong sign 0.5–1 cell off the surface: an extra surface piece,
-   so the stage was rejected and the refinement started from `D = 0` (see
-   [the warp Sampson stage](#the-warp-sampson-stage)).
+1. **Closed-form start** for `G`: least squares on `f(q) = 0` at the target points
+   and `f(x) = y d` (in cells) at the labelled points (`--off-weight`), a small
+   smoothness term (second differences of `G`), and a pull of every vertex towards
+   the same signed-distance estimate (the distance to the nearest target point, with
+   the inside/outside sign). The pull keeps the vertices far from the target well
+   defined. It is solved for each weight in `--anchor-weights` (0.03 and 0.3), and the
+   result with the fewest surface pieces, then the lowest RMS, is kept. (With normals,
+   the second term was `h ∇f(q) = n` at the target points.)
+2. **Sampson fit** (L-BFGS, no mesh, tight tolerances) of `f(q)² / |∇f(q)|²` plus a
+   **sign term** `--shell-weight · mean(relu(d − y f)²)` at the labelled points (`f`
+   is about the signed distance in cells): the scalar grid first, then for the warp
+   model `G` and `D` together, plus `--disp-penalty · mean(D²)`. The Sampson loss only
+   sees the target points; without the sign term the field made small bubbles of the
+   wrong sign 0.5–1 cell off the surface, extra surface pieces that got the stage
+   rejected (see [the warp Sampson stage](#the-warp-sampson-stage)).
 3. **Chamfer refinement through marching cubes** (Adam, `--iters`): mesh samples to
-   the target's tangent planes and target points to the mesh triangles, so the loss
-   has no sampling floor. The best iterate is kept.
+   the nearest target point (all of the cloud; 20000 samples of a function) and target
+   points to the mesh triangles (exact). The first term has the sampling floor of the
+   distances above. The best iterate is kept.
 
 After stage 1, a result replaces the current one only if it lowers the RMS **without
 adding surface pieces**. Small detached pieces barely change the RMS but are wrong;
@@ -541,7 +571,8 @@ without this rule the warp Sampson fit of the small ellipsoid "improved" the RMS
 while making 9 pieces.
 
 `--method logistic | es | grpo` are the classification optimizers of
-`classify_optimize.py`, with the points labelled by the target. They start from each
+`classify_optimize.py`, with the points labelled by the target: target points moved
+by a Gaussian of std `--band` in all directions, plus 25 % uniform. They start from each
 vertex's own label (±1), and for the warp model the scalar grid is trained first.
 On grids ES and GRPO use learning rate 0.01: with hundreds of numbers, most of whose
 estimated gradients are noise, a larger rate becomes a random walk that flips signs
@@ -554,7 +585,7 @@ python code/grid/grid_optimize.py --function torus_small --model warp --dims 12
 python code/grid/grid_optimize.py --function my_shape.py --lo -2 -2 -2 --size 4
 python code/grid/grid_optimize.py --points ellipsoid_long --dims 10
 python code/grid/grid_optimize.py --points my_scan.ply --fit-domain          # grid around the cloud
-python code/grid/grid_optimize.py --points torus_medium_no_normals           # normals estimated
+python code/grid/grid_optimize.py --points torus_medium --inside flood      # flood-fill inside/outside
 python code/grid/grid_optimize.py --function sphere_small --method logistic --chamfer-iters 100
 python code/grid/grid_optimize.py --function sphere_small --method grpo --dims 4
 ```
@@ -567,19 +598,22 @@ python code/grid/grid_optimize.py --function sphere_small --method grpo --dims 4
 | `--lo`, `--size`, `--fit-domain` | | the grid domain (see Targets) |
 | `--depth` | 2 | marching-cubes subdivision of each cell |
 | `--method` | chamfer | `chamfer`, `logistic`, `es`, `grpo` |
-| `--anchor-weights`, `--normal-weight`, `--smooth-weight` | 0.03 0.3, 1, 0.01 | chamfer stage 1 |
+| `--anchor-weights`, `--off-weight`, `--smooth-weight` | 0.03 0.3, 1, 0.01 | chamfer stage 1 |
 | `--sampson-iters` | 100 | chamfer stage 2 |
 | `--iters`, `--lr` | 300, 1e-3 | chamfer stage 3 |
 | `--disp-penalty` | 1e-3 | warp: λ · mean(D²), D in cells (also used by the classifiers) |
-| `--shell-weight` | 1e-2 | warp, chamfer stage 2: weight of the sign term off the target (0 = off) |
+| `--shell-weight` | 1e-2 | chamfer stage 2: weight of the sign term off the target (0 = off) |
+| `--inside`, `--inside-radius` | rays, 3 (flood: 5) | point clouds: the inside/outside test and its shell radius in point spacings |
 | `--samples` | 3000 | target points used by the optimizers |
 | `--class-iters`, `--class-lr`, `--sampling`, … | 400, … | classification: the options of `classify_optimize.py` |
 | `--chamfer-iters` | 0 | classification: chamfer refinement afterwards |
 | `--out` | | the fit file; default `data/fits/grid/<target>__<model>__<method>__<cells>.json`, with `_cloud` after the target name for a point cloud |
 
-The report gives the two-sided RMS distance (exact point-to-mesh distances), the
-maxima in both directions, the RMS in cells, the number of surface pieces, the
-watertightness check and, for warp, the largest displacement.
+The report gives the two-sided RMS distance (target to fit: exact point-to-mesh
+distances; fit to target: to the nearest point for a cloud), the maxima in both
+directions, the RMS in cells, the number of surface pieces, the watertightness check
+and, for warp, the largest displacement. For a cloud it also prints the floor, the RMS
+a perfect surface would get, `sqrt(area / (2π N))`.
 
 ### Viewing
 
@@ -614,61 +648,66 @@ python code/grid/fit_examples.py --dims 16 --examples torus_small ellipsoid_smal
 python code/grid/fit_examples.py --method logistic
 ```
 
-**Results** (chamfer, depth 2, default settings). RMS distance in world units
-(the domain is 2 wide), and in cells in parentheses (cell 0.25 at 8³, 0.125 at
-16³). All 80 fits are one closed, watertight piece, like their targets. A fit takes
-20–70 s at 8³ and 1–4 min at 16³ (warp about twice as long as scalar), on 2 CPU cores.
-The warp columns were rerun on 2026-11-22 with the sign term in stage 2 (see
-[the warp Sampson stage](#the-warp-sampson-stage)); the scalar columns are unchanged.
+**Results** (chamfer, depth 2, default settings, no normals, `--inside rays`). RMS
+distance in world units (the domain is 2 wide), and in cells in parentheses (cell 0.25
+at 8³, 0.125 at 16³). All 80 fits are one closed, watertight piece, like their
+targets. On this Mac (5 fits at a time, 2 threads each) a fit takes 20–40 s (scalar)
+and 30–90 s (warp) at 8³, 1–2 min and 1–4 min at 16³. Run on 2026-11-23.
 
-Functions:
+Functions (the error to the exact surface):
 
 | example | scalar 8³ | warp 8³ | scalar 16³ | warp 16³ |
 |---|---|---|---|---|
-| `ellipsoid_flat` | 3.3e-03 (0.013) | 1.8e-03 (0.007) | 1.0e-03 (0.008) | 7.6e-04 (0.006) |
-| `ellipsoid_long` | 8.5e-03 (0.034) | 2.1e-03 (0.008) | 2.0e-03 (0.016) | 7.8e-04 (0.006) |
-| `ellipsoid_small` | 1.1e-02 (0.043) | 2.9e-03 (0.012) | 4.1e-03 (0.033) | 8.2e-04 (0.007) |
-| `sphere_large` | 1.2e-03 (0.005) | 1.1e-03 (0.004) | 8.1e-04 (0.006) | 5.6e-04 (0.004) |
-| `sphere_medium` | 2.8e-03 (0.011) | 1.5e-03 (0.006) | 1.0e-03 (0.008) | 6.6e-04 (0.005) |
-| `sphere_small` | 5.3e-03 (0.021) | 2.3e-03 (0.009) | 2.0e-03 (0.016) | 6.7e-04 (0.005) |
-| `torus_large_thin` | 1.2e-02 (0.047) | 3.4e-03 (0.014) | 2.3e-03 (0.018) | 1.5e-03 (0.012) |
-| `torus_medium` | 3.7e-03 (0.015) | 2.2e-03 (0.009) | 1.7e-03 (0.014) | 9.4e-04 (0.007) |
-| `torus_small` | 2.4e-02 (0.098) | 3.3e-03 (0.013) | 3.3e-03 (0.026) | 1.0e-03 (0.008) |
+| `ellipsoid_flat` | 2.8e-03 (0.011) | 2.0e-03 (0.008) | 1.0e-03 (0.008) | 6.9e-04 (0.006) |
+| `ellipsoid_long` | 8.4e-03 (0.033) | 3.0e-03 (0.012) | 2.0e-03 (0.016) | 1.1e-03 (0.009) |
+| `ellipsoid_small` | 6.9e-03 (0.027) | 3.3e-03 (0.013) | 3.4e-03 (0.027) | 1.3e-03 (0.010) |
+| `sphere_large` | 1.8e-03 (0.007) | 1.0e-03 (0.004) | 7.7e-04 (0.006) | 6.5e-04 (0.005) |
+| `sphere_medium` | 3.5e-03 (0.014) | 1.9e-03 (0.008) | 9.5e-04 (0.008) | 6.5e-04 (0.005) |
+| `sphere_small` | 7.8e-03 (0.031) | 3.2e-03 (0.013) | 2.0e-03 (0.016) | 1.1e-03 (0.009) |
+| `torus_large_thin` | 9.5e-03 (0.038) | 3.4e-03 (0.014) | 2.6e-03 (0.021) | 1.5e-03 (0.012) |
+| `torus_medium` | 3.9e-03 (0.016) | 2.5e-03 (0.010) | 1.6e-03 (0.013) | 9.6e-04 (0.008) |
+| `torus_small` | 2.0e-02 (0.081) | 4.3e-03 (0.017) | 3.6e-03 (0.028) | 1.5e-03 (0.012) |
 
-Point clouds (5000 points each):
+Point clouds (5000 points each), measured against the exact surface of the function
+each was sampled from (`fit_examples.py --points` prints this as "exact RMS"):
 
 | point cloud | scalar 8³ | warp 8³ | scalar 16³ | warp 16³ |
 |---|---|---|---|---|
-| `ellipsoid_flat` | 3.2e-03 (0.013) | 1.5e-03 (0.006) | 1.1e-03 (0.009) | 6.8e-04 (0.005) |
-| `ellipsoid_long` | 8.4e-03 (0.034) | 2.1e-03 (0.008) | 2.0e-03 (0.016) | 6.8e-04 (0.005) |
-| `ellipsoid_small` | 1.0e-02 (0.042) | 2.4e-03 (0.010) | 4.0e-03 (0.032) | 7.6e-04 (0.006) |
-| `sphere_large` | 1.1e-03 (0.004) | 9.4e-04 (0.004) | 7.3e-04 (0.006) | 5.5e-04 (0.004) |
-| `sphere_medium` | 2.8e-03 (0.011) | 1.5e-03 (0.006) | 1.1e-03 (0.009) | 7.4e-04 (0.006) |
-| `sphere_medium_noisy` | 6.1e-03 (0.024) | 4.9e-03 (0.020) | 4.7e-03 (0.038) | 4.6e-03 (0.037) |
-| `sphere_small` | 5.2e-03 (0.021) | 2.2e-03 (0.009) | 2.0e-03 (0.016) | 6.4e-04 (0.005) |
-| `torus_large_thin` | 1.2e-02 (0.047) | 3.2e-03 (0.013) | 2.5e-03 (0.020) | 1.2e-03 (0.009) |
-| `torus_medium` | 3.6e-03 (0.015) | 2.0e-03 (0.008) | 1.7e-03 (0.013) | 7.8e-04 (0.006) |
-| `torus_medium_no_normals` | 3.7e-03 (0.015) | 2.1e-03 (0.008) | 1.7e-03 (0.014) | 9.3e-04 (0.007) |
-| `torus_small` | 2.5e-02 (0.098) | 3.2e-03 (0.013) | 3.9e-03 (0.031) | 1.1e-03 (0.008) |
+| `ellipsoid_flat` | 2.9e-03 (0.012) | 2.0e-03 (0.008) | 1.2e-03 (0.009) | 7.8e-04 (0.006) |
+| `ellipsoid_long` | 8.1e-03 (0.032) | 2.8e-03 (0.011) | 1.9e-03 (0.016) | 1.0e-03 (0.008) |
+| `ellipsoid_small` | 6.8e-03 (0.027) | 3.6e-03 (0.014) | 3.6e-03 (0.028) | 1.3e-03 (0.010) |
+| `sphere_large` | 1.7e-03 (0.007) | 1.0e-03 (0.004) | 1.0e-03 (0.008) | 8.6e-04 (0.007) |
+| `sphere_medium` | 3.5e-03 (0.014) | 1.9e-03 (0.007) | 1.1e-03 (0.009) | 8.8e-04 (0.007) |
+| `sphere_medium_noisy` | 3.5e-03 (0.014) | 2.2e-03 (0.009) | 2.4e-03 (0.020) | 2.7e-03 (0.021) |
+| `sphere_small` | 7.8e-03 (0.031) | 3.3e-03 (0.013) | 2.0e-03 (0.016) | 1.1e-03 (0.008) |
+| `torus_large_thin` | 9.5e-03 (0.038) | 3.5e-03 (0.014) | 2.7e-03 (0.021) | 1.5e-03 (0.012) |
+| `torus_medium` | 3.9e-03 (0.015) | 2.5e-03 (0.010) | 1.7e-03 (0.014) | 1.1e-03 (0.009) |
+| `torus_medium_no_normals` | 3.9e-03 (0.015) | 2.5e-03 (0.010) | 1.7e-03 (0.014) | 1.1e-03 (0.009) |
+| `torus_small` | 2.0e-02 (0.081) | 4.1e-03 (0.016) | 3.6e-03 (0.029) | 1.5e-03 (0.012) |
 
-* **16³ against 8³.** Halving the cell size cuts the error 1.5–4× on the shapes that
-  8³ already resolves, and 2–7× on the thin ones (small ellipsoid, small torus, thin
-  torus), which are crude with the scalar model at 8³: the small torus's tube radius
-  (0.12) is under half a cell there. For warp it cuts the error 1.7–3.5×.
-* **Warp against scalar.** Warp is better on every example. At 8³: 1.1–1.25× on the
-  large sphere and the noisy cloud, 1.7–2.4× on the other spheres, the medium torus and
-  the flat ellipsoid, 3.5–4.3× on the long and small ellipsoids and the thin torus,
-  7.5× on the small torus. At 16³: 1.3–2.1× on the large and medium spheres, the flat
-  ellipsoid and the medium and thin tori, 2.6–3.7× on the long ellipsoid, the small
-  sphere and the small torus, 5× on the small ellipsoid (the noisy cloud stays at its
-  noise floor). A finer grid still mostly helps more than the warp: scalar 16³ (4913
-  numbers) beats warp 8³ (2916 numbers) by 1.1–1.7× on most examples, they are even on
-  the long ellipsoid and the small torus function, and warp 8³ is better on the small
-  ellipsoid (1.4–1.7×) and the small torus cloud (1.2×).
-* **Point clouds fit about as well as the functions** they were sampled from (within
-  25 %), also with estimated normals (`torus_medium_no_normals`). The noisy cloud (std
-  0.005) stays at about 4.6e-3 even at 16³: the error is measured to the noisy points,
-  so the noise is a floor.
+* **Against the fits with normals** (2026-11-22, same machine, same measure): the
+  geometric mean of new / old is 1.00 (scalar 8³), 1.17 (warp 8³), 0.97 (scalar 16³)
+  and 1.21 (warp 16³) for the functions, and 0.99, 1.19, 1.04 and 1.24 for the clouds.
+  Better without normals: the thin and small shapes with the scalar model at 8³ (small
+  ellipsoid 0.63×, thin torus 0.80×, small torus 0.83×), because the scalar Sampson
+  step is now kept (with normals it was rejected for most shapes). Worse: the spheres
+  with the scalar model at 8³ (1.25–1.47×) and the small sphere and small ellipsoid
+  with warp at 16³ (1.55–1.63×); the sign term (margin 1) bends small curved shapes a
+  little, and the refinement does not undo it.
+* **16³ against 8³** cuts the error 2.0–5.7× for scalar (geometric mean 3.2) and
+  1.5–2.9× for warp (2.6). **Warp against scalar** is 1.4–4.7× better at 8³ (2.2) and
+  1.2–2.6× at 16³ (1.7); only the noisy cloud at 16³ is slightly worse with warp
+  (2.7e-3 against 2.4e-3).
+* **Point clouds fit about as well as the functions** they were sampled from
+  (0.93–1.36×; the larger gaps are the large and medium spheres at 16³). The noisy
+  cloud (std 0.005) comes within 2.2–3.5e-3 of the exact sphere, below the noise.
+* **The reported RMS of a cloud fit** (to the nearest point) is 5.6e-3–2.2e-2, and
+  for 33 of the 44 fits within 10 % of its floor (the RMS of a perfect surface): it
+  does not separate the fits, which is why the table measures against the exact
+  shapes. Only the coarse scalar 8³ fits of the small shapes stand out (1.6–2.7× the
+  floor).
+* **`--inside flood`** gives the same fits: flood / rays is 0.96–1.15 per fit, 1.00 on
+  average.
 
 `grid_overview.py` draws all of these; `overview_functions.png` and
 `overview_point_clouds.png` in `data/fits/grid` show them next to their targets.
@@ -699,5 +738,36 @@ Two things remain:
 * The keep rule counts pieces at depth 2, the report at depth 3. The previous code's
   8³ fit of the long ellipsoid on the laptop passed with one piece at depth 2 and had 5
   at depth 3 (RMS 1.5e-2).
-* The scalar Sampson step has the same weakness: for most shapes it adds pieces and is
-  rejected. The sign term is not used there yet, so the scalar columns are unchanged.
+* The scalar Sampson step had the same weakness: for most shapes it added pieces and
+  was rejected. Since the change to no normals it has the sign term too (see below), and
+  it is kept in 36 of the 40 scalar fits of the tables.
+
+### Without normals
+
+Since 2026-11-23 no stage uses normals (before: normals from the file or estimated,
+tangent-plane distances, and `h ∇f = n` in stage 1). What had to change, and what was
+tried:
+
+* **The scale of `G`.** `h ∇f = n` used to fix the scale of `G` in stage 1. Without it,
+  the Sampson loss `f² / |∇f|²` does not change when `G` is scaled, and a sign term on
+  `f` itself (`y f ≥ d`) is met by any large enough `f`: L-BFGS scaled `G` up to 1e4,
+  and the field made extra pieces away from the labelled points (37 on the thin torus
+  cloud at 8³). The scalar step was rejected in 8 of 12 test runs. The sign term is
+  now on the first-order distance `f / (h |∇f|)`, which is scale-free: kept in 10 of
+  the 12. Tried and dropped: an eikonal term `(|h ∇f| − 1)²` (it held the scale but made
+  the fits worse), margins 0.5 and 0.25, and capping the margin at 0.5 or 0.75 cells
+  (each more accurate on some shapes, and extra pieces on thin or small ones).
+* **The floor of the point-to-point distance.** A perfect surface is about 1e-2 RMS
+  from the examples' 5000 points, against shape errors of 1e-3. In the keep rule the
+  floor's sampling noise was larger than the differences it decides on (a Sampson step
+  that cut the exact error from 1.8e-3 to 6.8e-4 was rejected), and in stage 3 its
+  gradient is noise: the refinement stalled (warp 16³ clouds were 1.7× the fits with
+  normals, now 1.24×). Both count fit → target only beyond 3 point spacings, where a
+  perfect surface has 0.2 % of its samples; target → fit is exact and sets the
+  accuracy. The report still gives the full point-to-point RMS, with the floor and the
+  target → fit RMS next to it.
+* **Stage 1** fits `f = y d` at the labelled points instead of `h ∇f = n`. Its weight
+  (`--off-weight` 1, 0.3, 0.1) changed the start but not the result after stage 2.
+* **The labelled points** are moved from target points in random directions, so they
+  are balanced (half inside): random moves from a convex surface end up outside about
+  twice as often.

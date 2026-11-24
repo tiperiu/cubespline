@@ -17,7 +17,7 @@ Usage (from the project folder):
     python code/visualization/grid_viewer.py
     python code/visualization/grid_viewer.py --load sphere_medium__warp__chamfer__8.json
     python code/visualization/grid_viewer.py --function torus_medium --dims 6
-    python code/visualization/grid_viewer.py --points torus_medium_no_normals
+    python code/visualization/grid_viewer.py --points torus_medium
 """
 
 from __future__ import annotations
@@ -106,7 +106,7 @@ def scan():
 def example_grid(kind, path) -> Grid:
     dims = (S.dims,) * 3
     if kind == "points":
-        P, _ = T.load_point_cloud(path)
+        P = T.load_point_cloud(path)
         if np.all(P >= -1) and np.all(P <= 1):
             return Grid.cube(dims)
         return T.default_grid(dims, target_bounds=(P.min(0), P.max(0)))

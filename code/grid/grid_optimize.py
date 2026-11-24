@@ -7,39 +7,44 @@ Models (--model):
     scalar   one value G per grid vertex; f is trilinear in every cell
     warp     a value G and a 3D displacement D per vertex: f(x) = G(x + h D(x))
 
+No method uses normals. A target is points on the surface, an inside/outside label (the
+sign of g for a function; for a point cloud the test of inside_outside.py, --inside) and
+the distance to the target points.
+
 Methods (--method):
     chamfer  (default) surface distance, three stages:
              1. closed-form start for G (scalar): least squares with
-                    f(q) = 0 and h grad f(q) = n at the target points (q, n),
+                    f(q) = 0 at the target points q, and
+                    f(x) = y d at labelled points x 0.25-1.5 cells off the target (y = +1
+                    outside, -1 inside; d the distance to the target in cells; see
+                    shell_points),
                     a small second-difference smoothness term, and a weak pull of every
-                    vertex towards its estimated signed distance (distance to the nearest
-                    target point, signed by the target's inside/outside), which keeps the
+                    vertex towards the same signed-distance estimate, which keeps the
                     vertices far from the target well defined (no spurious surfaces there);
                 the result is about the signed distance, in cell units. It is solved for
-                each pull weight in --anchor-weights (0.03 suits shapes several cells
-                thick, 0.3 thin ones) and the result with the fewest surface pieces,
-                then the lowest RMS, is kept.
-             2. Sampson fit (L-BFGS, no mesh): f(q)^2 / |grad f(q)|^2 + a small normal
-                term over G; for warp then over G and D together, from that result,
-                plus --disp-penalty * mean(D^2) and a sign term (--shell-weight) at
-                labelled points 0.25-1.5 cells off the target: y f >= d (d the distance
-                in cells, y = +1 outside). The Sampson loss only sees the target points,
-                and without the sign term D often made a small bubble of the wrong sign
-                0.5-1 cell off the surface, an extra surface piece that got the stage
-                rejected.
+                each pull weight in --anchor-weights (0.03, 0.3) and the result with the
+                fewest surface pieces, then the lowest RMS, is kept.
+             2. Sampson fit (L-BFGS, no mesh): f(q)^2 / |grad f(q)|^2 at the target points
+                plus a sign term (--shell-weight) at the labelled points:
+                y f / (h |grad f|) >= d. Both are unchanged when G is scaled. First over
+                G; for warp then over G and D together, from that result, plus
+                --disp-penalty * mean(D^2). The Sampson loss alone only sees the target
+                points, and the field made small bubbles of the wrong sign off the
+                surface, extra surface pieces that got the stage rejected.
              3. chamfer refinement through marching cubes (Adam): mesh the grid, sample
-                the mesh, and minimise a two-sided chamfer distance measured to the
-                surfaces (mesh samples to the target points' tangent planes, target
-                points to the mesh triangles), so it has no sampling floor; vertices are
-                differentiable (exact crossings for scalar, implicit-function derivative
-                of the bisected crossings for warp). The best iterate is kept.
+                the mesh, and minimise a two-sided chamfer distance: mesh samples to the
+                nearest target point, target points to the mesh triangles (exact);
+                vertices are differentiable (exact crossings for scalar, implicit-function
+                derivative of the bisected crossings for warp). The best iterate is kept.
              After stage 1, a result (a stage, or an iterate of stage 3) replaces the
              current one only if it lowers the RMS without adding surface pieces: small
-             detached pieces barely change the RMS but are wrong.
+             detached pieces barely change the RMS but are wrong. (For a point cloud
+             this RMS leaves out the floor of the distance to the nearest point; see
+             quick_check.)
     logistic, es, grpo
-             inside/outside classification, as in classify_optimize.py: points labelled
-             by the target (sign of g, or the side of the nearest point's tangent plane
-             for a point cloud), and the field rewarded for the correct sign. The start
+             inside/outside classification, as in classify_optimize.py: points near the
+             target (target points moved by --band in random directions) and uniform in
+             the grid, labelled by the target, and the field rewarded for the correct sign. The start
              is each vertex's own label (-1 inside, +1 outside), so vertices far from the
              target begin on the right side. For the warp model the scalar grid is
              trained first, then G and D together.
@@ -62,7 +67,7 @@ Usage (from the project folder):
     python code/grid/grid_optimize.py --function sphere_medium                 # scalar grid, 8^3 cells, chamfer
     python code/grid/grid_optimize.py --function torus_medium --model warp --dims 6
     python code/grid/grid_optimize.py --points ellipsoid_long --dims 10
-    python code/grid/grid_optimize.py --points torus_medium_no_normals          # normals estimated
+    python code/grid/grid_optimize.py --points torus_medium --inside flood      # flood-fill inside/outside
     python code/grid/grid_optimize.py --function my_shape.py --lo -2 -2 -2 --size 4
     python code/grid/grid_optimize.py --function sphere_small --method logistic --chamfer-iters 100
     python code/grid/grid_optimize.py --function sphere_small --method grpo --dims 4
@@ -92,7 +97,7 @@ import optimization.optimize as O
 from core.geometry import closest_point_triangle, count_pieces, point_mesh_dist2
 from core.paths import GRID_FITS, REPO, output_path
 from grid import targets as T
-from grid.grid import DT, Grid, GridModel, basis, basis_grad
+from grid.grid import DT, Grid, GridModel, basis
 from grid.grid_marching import extract_topology, mesh_check
 
 
@@ -101,12 +106,14 @@ class GridFitConfig:
     model: str = "scalar"          # scalar | warp
     method: str = "chamfer"        # chamfer | logistic | es | grpo
     depth: int = 2                 # marching-cubes subdivision of each cell (2^depth per axis)
-    normal_weight: float = 1.0     # stage 1: weight of h grad f = n
+    off_weight: float = 1.0        # stage 1: weight of f = y d at the labelled points off the target
     smooth_weight: float = 0.01    # stage 1: weight of the second differences of G
     anchor_weights: tuple = (0.03, 0.3)   # stage 1: pulls towards the estimated signed distance (one fit each)
     sampson_iters: int = 100       # stage 2: L-BFGS iterations (0 = skip)
     disp_penalty: float = 1e-3     # warp: lambda * mean(D^2), D in cell units
-    shell_weight: float = 1e-2     # warp stage 2: sign term at points off the target (see shell_points)
+    shell_weight: float = 1e-2     # stage 2: sign term at the labelled points off the target (see shell_points)
+    inside: str = "rays"           # point clouds: inside/outside test (rays | flood, see inside_outside.py)
+    inside_radius: float | None = None   # its shell radius in point spacings (None: 3 for rays, 5 for flood)
     iters: int = 300              # stage 3: Adam steps of the chamfer refinement
     lr: float = 1e-3
     lr_final: float = 1e-5
@@ -134,19 +141,20 @@ def signed_distance_estimate(grid: Grid, target: T.GridTarget) -> torch.Tensor:
     """At every vertex: distance to the nearest target point, in cells, with the sign of
     the target's inside/outside label."""
     X = torch.as_tensor(grid.vertex_positions(), dtype=DT)
-    cloud = torch.as_tensor(target.cloud, dtype=DT)
-    d = (X - cloud[O.nearest(X, cloud)]).norm(dim=-1)
-    return target.label(X) * d / grid.h
+    return target.label(X) * target.cloud_distance(X) / grid.h
 
 
-def fit_closed_form(grid: Grid, target: T.GridTarget, normal_weight=1.0, smooth_weight=0.01,
+def fit_closed_form(grid: Grid, target: T.GridTarget, shell: tuple, off_weight=1.0, smooth_weight=0.01,
                     anchor_weight=0.03, iters=300) -> torch.Tensor:
-    """G (V,) minimising  mean f(q)^2 + mu mean |h grad f(q) - n|^2 + lam mean(second diff^2)
-    + a mean (G - SDF0)^2, with SDF0 the signed-distance estimate (also the start).
-    A convex quadratic, solved with L-BFGS."""
-    P, N = target.points, target.normals
-    ids, t = grid.locate(P)
-    w, dw = basis(t), basis_grad(t)                                   # (n, 8), (n, 3, 8)
+    """G (V,) minimising  mean f(q)^2 + mu mean (f(x) - y d)^2 + lam mean(second diff^2)
+    + a mean (G - SDF0)^2: f = 0 at the target points q, f = the signed distance y d (in
+    cells) at the labelled points x of shell_points, and SDF0 the signed-distance estimate
+    at the vertices (also the start). A convex quadratic, solved with L-BFGS."""
+    ids, t = grid.locate(target.points)
+    w = basis(t)                                                      # (n, 8)
+    X, y, d = shell
+    ids_x, tx = grid.locate(X)
+    wx, yd = basis(tx), y * d
     trip = torch.as_tensor(second_differences(grid))
     sdf0 = signed_distance_estimate(grid, target)
     G = sdf0.clone().requires_grad_(True)
@@ -155,10 +163,9 @@ def fit_closed_form(grid: Grid, target: T.GridTarget, normal_weight=1.0, smooth_
 
     def closure():
         opt.zero_grad()
-        Gc = G[ids]
-        f = (w * Gc).sum(-1)
-        gr = (dw * Gc[:, None, :]).sum(-1)                            # h * grad f
-        loss = f.square().mean() + normal_weight * (gr - N).square().sum(-1).mean()
+        f = (w * G[ids]).sum(-1)
+        fx = (wx * G[ids_x]).sum(-1)
+        loss = f.square().mean() + off_weight * (fx - yd).square().mean()
         if len(trip) and smooth_weight:
             loss = loss + smooth_weight * (G[trip[:, 0]] - 2 * G[trip[:, 1]] + G[trip[:, 2]]).square().mean()
         if anchor_weight:
@@ -177,31 +184,50 @@ SHELL_MARGIN = 1.0                  # sign term: y f >= SHELL_MARGIN * d (f is a
 
 
 def shell_points(target: T.GridTarget, grid: Grid, n=6000, seed=0) -> tuple:
-    """(X, y, d): n points 0.25-1.5 cells off the target, on both sides (target points
-    moved along their normals), with the target's label y (+1 outside, -1 inside) and
-    distance d in cells. The labels and distances come from the target, not from the
-    offset, so points that cross a thin part of the shape are labelled correctly."""
+    """(X, y, d): n points 0.25-1.5 cells off the target, half outside and half inside,
+    with the target's label y (+1 outside, -1 inside) and distance d in cells. They are
+    target points moved by up to 1.8 cells in random directions, kept if their distance
+    to the target (not the offset) is in range; the labels also come from the target, so
+    points that cross a thin part of the shape are labelled correctly. (Random moves
+    from a convex surface end up outside more often, hence the balancing.)"""
     gen = torch.Generator().manual_seed(seed)
-    P, N = target.points, target.normals
-    idx = torch.randint(len(P), (n,), generator=gen)
+    P = target.points
     lo, hi = SHELL_CELLS
-    t = lo + (hi - lo) * torch.rand(n, dtype=DT, generator=gen)
-    t = torch.where(torch.rand(n, generator=gen) < 0.5, -t, t)
-    X = grid.clamp(P[idx] + N[idx] * (t * grid.h)[:, None])
-    return X, target.label(X), torch.as_tensor(target.distance(X), dtype=DT) / grid.h
+    Xs, ys, ds = [], [], []
+    for _ in range(50):
+        m = 2 * n
+        u = torch.randn(m, 3, dtype=DT, generator=gen)
+        u = u / u.norm(dim=-1, keepdim=True)
+        t = lo + (1.2 * hi - lo) * torch.rand(m, dtype=DT, generator=gen)
+        X = grid.clamp(P[torch.randint(len(P), (m,), generator=gen)] + u * (t * grid.h)[:, None])
+        d = torch.as_tensor(target.distance(X), dtype=DT) / grid.h
+        ok = (d >= lo) & (d <= hi)
+        Xs.append(X[ok])
+        ds.append(d[ok])
+        ys.append(target.label(X[ok]))
+        y = torch.cat(ys)
+        if min((y > 0).sum(), (y < 0).sum()) >= n // 2:
+            break
+    X, y, d = torch.cat(Xs), torch.cat(ys), torch.cat(ds)
+    keep = torch.cat([torch.nonzero(y > 0).flatten()[:n // 2], torch.nonzero(y < 0).flatten()[:n - n // 2]])
+    return X[keep], y[keep], d[keep]
 
 
-def sampson_loss(model: GridModel, p, P, N, normal_weight=1e-3, disp_penalty=0.0, shell=None, shell_weight=0.0):
+def sampson_loss(model: GridModel, p, P, disp_penalty=0.0, shell=None, shell_weight=0.0):
+    """mean f^2 / |grad f|^2 at the target points, + the sign term at the labelled points:
+    y f / (h |grad f|) >= d, the first-order signed distance in cells at least the distance.
+    Both terms are unchanged when G is scaled; a sign term on f itself was met by blowing
+    G up (|G| ~ 1e4), and the field then made extra pieces away from the labelled points."""
     f = model.field(p, P)
     g = model.gradient(p, P)
-    g2 = g.square().sum(-1).clamp_min(1e-12)
-    loss = (f.square() / g2).mean() + normal_weight * (1 - (g * N).sum(-1) / g2.sqrt()).mean()
+    loss = (f.square() / g.square().sum(-1).clamp_min(1e-12)).mean()
     _, D = model.split(p)
     if D is not None and disp_penalty:
         loss = loss + disp_penalty * D.square().mean()
     if shell is not None and shell_weight:
         X, y, d = shell
-        loss = loss + shell_weight * torch.relu(SHELL_MARGIN * d - y * model.field(p, X)).square().mean()
+        fx = model.field(p, X) / (model.grid.h * model.gradient(p, X).norm(dim=-1).clamp_min(1e-12))
+        loss = loss + shell_weight * torch.relu(SHELL_MARGIN * d - y * fx).square().mean()
     return loss
 
 
@@ -210,13 +236,13 @@ def fit_sampson(model: GridModel, target: T.GridTarget, p0, iters=100, disp_pena
     """L-BFGS on sampson_loss. tight: run all iterations; with the default tolerances
     L-BFGS can stop after one step, because the loss is only about 1e-5."""
     p = p0.clone().requires_grad_(True)
-    P, N = target.points[:n_points], target.normals[:n_points]
+    P = target.points[:n_points]
     tol = dict(tolerance_grad=1e-12, tolerance_change=1e-15) if tight else {}
     opt = torch.optim.LBFGS([p], lr=1, max_iter=iters, history_size=30, line_search_fn="strong_wolfe", **tol)
 
     def closure():
         opt.zero_grad()
-        loss = sampson_loss(model, p, P, N, disp_penalty=disp_penalty, shell=shell, shell_weight=shell_weight)
+        loss = sampson_loss(model, p, P, disp_penalty=disp_penalty, shell=shell, shell_weight=shell_weight)
         loss.backward()
         return loss
     opt.step(closure)
@@ -226,9 +252,17 @@ def fit_sampson(model: GridModel, target: T.GridTarget, p0, iters=100, disp_pena
 # ============================================================================
 # Stage 3: chamfer refinement, and the error measures
 # ============================================================================
+KEEP_SPACINGS = 3.0     # quick_check, point clouds: fit -> target counts beyond this many point spacings
+
+
 def quick_check(model: GridModel, p, target: T.GridTarget, depth, n=4000) -> tuple:
     """(RMS distance, surface pieces), for keep-best: fit -> target by target.distance at
-    mesh samples, target -> fit exact point-to-mesh distance of 2000 target points."""
+    mesh samples, target -> fit exact point-to-mesh distance of 2000 target points.
+    For a point cloud fit -> target only counts beyond 3 point spacings: the distance to
+    the nearest point has a floor (about 1e-2 for the examples) whose sampling noise was
+    larger than the differences the keep rule decides on; beyond 3 spacings a perfect
+    surface has almost no samples (0.2 %), so the term still catches surface far from
+    the points."""
     with torch.no_grad():
         topo = extract_topology(model, p, depth)
         if not len(topo.F):
@@ -236,6 +270,8 @@ def quick_check(model: GridModel, p, target: T.GridTarget, depth, n=4000) -> tup
         V = topo.vertices(p)
         S = O.surface_samples(V, topo.F, n, torch.Generator().manual_seed(11))
         d1 = target.distance(S)
+        if target.kind == "points":
+            d1 = np.maximum(d1 - KEEP_SPACINGS * target.spacing(), 0)
         d2 = point_mesh_dist2(target.points[:2000], V, topo.F).sqrt().numpy()
     return float(np.sqrt((np.mean(d1 ** 2) + np.mean(d2 ** 2)) / 2)), count_pieces(topo.F)
 
@@ -252,17 +288,17 @@ def improves(new: tuple, best: tuple) -> bool:
 
 
 def surface_chamfer(S: torch.Tensor, V: torch.Tensor, F: np.ndarray, target: T.GridTarget, Q: torch.Tensor,
-                    cloud: torch.Tensor, cloud_n: torch.Tensor, k: int = 8) -> torch.Tensor:
-    """Two-sided chamfer between the fitted mesh (V, F; samples S on it) and the target,
-    measured to the surfaces rather than to samples, so it has no sampling floor:
-      fit -> target   squared distance from each mesh sample to the tangent plane of
-                      the nearest target point (point-to-plane)
+                    k: int = 8) -> torch.Tensor:
+    """Two-sided chamfer between the fitted mesh (V, F; samples S on it) and the target:
+      fit -> target   squared distance from each mesh sample to the nearest target point
+                      (all of target.cloud), counted beyond 3 point spacings: below that
+                      it is mostly the sampling floor (area / (pi N) for N points), whose
+                      gradient is noise; beyond it, it removes surface far from the target
       target -> fit   squared distance from each target point Q to the mesh (closest
-                      point on the nearest of k candidate triangles), differentiable in V
+                      point on the nearest of k candidate triangles), differentiable in V;
+                      exact, so it sets the accuracy
     """
-    with torch.no_grad():
-        nn = O.nearest(S, cloud)
-    d_fit = ((S - cloud[nn]) * cloud_n[nn]).sum(-1)
+    d_fit = torch.relu(target.cloud_distance(S) - KEEP_SPACINGS * target.spacing())
     Fi = torch.as_tensor(np.asarray(F, np.int64))
     with torch.no_grad():
         cen = V.detach()[Fi].mean(1)
@@ -282,7 +318,6 @@ def chamfer_refine(model: GridModel, target: T.GridTarget, p0, cfg: GridFitConfi
     g_norm = float(p.detach()[model.field_slice].norm())
     h2 = model.grid.h ** 2
     best_p, best = p.detach().clone(), quick_check(model, p.detach(), target, cfg.depth)
-    cloud, cloud_n = target.points, target.normals            # tangent planes for the fit -> target term
     history = [(0, None, best[0])]
     t0 = time.time()
     for it in range(cfg.iters):
@@ -296,7 +331,7 @@ def chamfer_refine(model: GridModel, target: T.GridTarget, p0, cfg: GridFitConfi
         V = topo.vertices(p)
         S = O.surface_samples(V, topo.F, cfg.samples, gen)
         Q = target.points[torch.randperm(len(target.points), generator=gen)[:cfg.samples]]
-        loss = surface_chamfer(S, V, topo.F, target, Q, cloud, cloud_n) / h2
+        loss = surface_chamfer(S, V, topo.F, target, Q) / h2
         _, D = model.split(p)
         if D is not None and cfg.disp_penalty:
             loss = loss + cfg.disp_penalty * D.square().mean()
@@ -318,7 +353,9 @@ def chamfer_refine(model: GridModel, target: T.GridTarget, p0, cfg: GridFitConfi
 def evaluate(model: GridModel, p, target: T.GridTarget, depth=3, n=20000) -> dict:
     """Final errors: two-sided chamfer distance with exact point-to-mesh distances for
     target -> fit (fit -> target: |g|/|grad g| for a function, nearest point for a
-    cloud), RMS, maxima, surface pieces and a watertightness check."""
+    cloud), RMS, maxima, surface pieces and a watertightness check. For a cloud also
+    rms_floor: the RMS a perfect surface would get, sqrt(area / (pi N) / 2), since the
+    mesh samples are on average that far from the nearest of N random points."""
     p = torch.as_tensor(p, dtype=DT)
     with torch.no_grad():
         topo = extract_topology(model, p, depth)
@@ -331,11 +368,16 @@ def evaluate(model: GridModel, p, target: T.GridTarget, depth=3, n=20000) -> dic
         d2 = point_mesh_dist2(Q, V, topo.F).sqrt().numpy()
     cd = float(np.mean(d1 ** 2) + np.mean(d2 ** 2))
     chk = mesh_check(V, topo.F, model.grid)
-    out = {"cd": cd, "rms": float(np.sqrt(cd / 2)), "fit_to_target_max": float(d1.max()),
+    out = {"cd": cd, "rms": float(np.sqrt(cd / 2)), "rms_target_to_fit": float(np.sqrt(np.mean(d2 ** 2))),
+           "fit_to_target_max": float(d1.max()),
            "target_to_fit_max": float(d2.max()), "rms_in_cells": float(np.sqrt(cd / 2)) / model.grid.h,
            "cell_size": model.grid.h, "surface_pieces": count_pieces(topo.F),
            "target_pieces": count_pieces(target.F) if target.F is not None and len(target.F) else None,
            "watertight": chk["ok"], "boundary_edges": chk["boundary_edges"], "faces": len(topo.F)}
+    if target.kind == "points":
+        Fi = torch.as_tensor(np.asarray(topo.F, np.int64))
+        area = float(0.5 * torch.linalg.cross(V[Fi[:, 1]] - V[Fi[:, 0]], V[Fi[:, 2]] - V[Fi[:, 0]]).norm(dim=-1).sum())
+        out["rms_floor"] = float(np.sqrt(area / (np.pi * len(target.cloud)) / 2))
     _, D = model.split(p)
     if D is not None:
         out["max_displacement_cells"] = float(D.norm(dim=-1).max())
@@ -354,6 +396,10 @@ def print_report(err: dict, title="final error"):
                   f"{100 * err[k]:.3f} %")
     print(f"  chamfer distance (CD)                {err['cd']:.4e}   (mean d^2 both ways, world units^2)")
     print(f"  RMS distance                         {err['rms']:.4e}   ({err['rms_in_cells']:.3f} cells of {err['cell_size']:g})")
+    if "rms_floor" in err:
+        print(f"  RMS of a perfect surface (floor)     {err['rms_floor']:.4e}   (fit -> target is to the nearest point)")
+    if "rms_target_to_fit" in err:
+        print(f"  RMS target -> fit                    {err['rms_target_to_fit']:.4e}   (exact point-to-mesh, no floor)")
     print(f"  max  fit -> target                   {err['fit_to_target_max']:.4e}")
     print(f"  max  target -> fit                   {err['target_to_fit_max']:.4e}")
     tp = err.get("target_pieces")
@@ -386,10 +432,10 @@ class GridSampler:
         return self.lattice if self.lattice is not None else self.draw_random(n, gen)
 
     def draw_random(self, n, gen):
-        P, N = self.target.points, self.target.normals
+        P = self.target.points
         nu = int(round(self.uniform * n))
         idx = torch.randint(len(P), (n - nu,), generator=gen)
-        Xs = P[idx] + N[idx] * (self.band * torch.randn(n - nu, 1, dtype=DT, generator=gen))
+        Xs = P[idx] + self.band * torch.randn(n - nu, 3, dtype=DT, generator=gen)     # Gaussian, all directions
         X = self.grid.clamp(torch.cat([Xs, self.grid.uniform(nu, gen)]))
         return X, self.target.label(X)
 
@@ -440,9 +486,10 @@ def fit(model: GridModel, target: T.GridTarget, cfg: GridFitConfig, ccfg: C.Clas
     info = {"stages": []}
     t0 = time.time()
     if cfg.method == "chamfer":
+        shell = shell_points(target, model.grid, seed=cfg.seed)      # labelled points off the target
         best = None
         for a in np.atleast_1d(cfg.anchor_weights):
-            Ga = fit_closed_form(model.grid, target, cfg.normal_weight, cfg.smooth_weight, float(a))
+            Ga = fit_closed_form(model.grid, target, shell, cfg.off_weight, cfg.smooth_weight, float(a))
             sa = quick_check(model, model.join(Ga), target, cfg.depth)
             if verbose:
                 print(f"  1. closed form, pull {float(a):<6g}   RMS {sa[0]:.4e}, {sa[1]} pieces")
@@ -456,14 +503,14 @@ def fit(model: GridModel, target: T.GridTarget, cfg: GridFitConfig, ccfg: C.Clas
             # scalar Sampson first; for the warp model then values and displacements
             # together, from there. Each step is kept only if it improves (see improves).
             scalar = GridModel(model.grid, "scalar")
-            G2 = fit_sampson(scalar, target, G, cfg.sampson_iters)
+            sh = shell if cfg.shell_weight else None
+            G2 = fit_sampson(scalar, target, G, cfg.sampson_iters, shell=sh, shell_weight=cfg.shell_weight, tight=True)
             p2 = model.join(G2)
             s2 = quick_check(model, p2, target, cfg.depth)
             if improves(s2, s):
                 p, s = p2, s2
             if model.kind == "warp":
-                shell = shell_points(target, model.grid, seed=cfg.seed) if cfg.shell_weight else None
-                p3 = fit_sampson(model, target, p, cfg.sampson_iters, cfg.disp_penalty, shell=shell,
+                p3 = fit_sampson(model, target, p, cfg.sampson_iters, cfg.disp_penalty, shell=sh,
                                  shell_weight=cfg.shell_weight, tight=True)
                 s3 = quick_check(model, p3, target, cfg.depth)
                 if verbose:
@@ -539,7 +586,9 @@ def load_fit(path) -> dict:
             if tinfo.get("kind") == "function":
                 target = T.load_target(grid, function=str(cand if cand.exists() else tinfo.get("name")))
             else:
-                target = T.load_target(grid, points=str(cand if cand.exists() else tinfo.get("name")))
+                conf = data.get("config") or {}
+                target = T.load_target(grid, points=str(cand if cand.exists() else tinfo.get("name")),
+                                       inside=conf.get("inside", "rays"), inside_radius=conf.get("inside_radius"))
         except Exception as e:  # noqa: BLE001
             print(f"  (target not loaded: {e})")
     return {"model": model, "params": torch.as_tensor(data["params"], dtype=DT), "grid": grid,
@@ -607,14 +656,15 @@ def make_grid_and_target(args):
         grid = T.default_grid(dims, lo=args.lo if explicit else -1.0, size=args.size if explicit else 2.0)
         return grid, T.load_target(grid, function=args.function, n=args.samples, seed=args.seed)
     path = T.resolve_points(args.points)
-    P, N = T.load_point_cloud(path)
+    P = T.load_point_cloud(path)
     if explicit:
         grid = T.default_grid(dims, lo=args.lo, size=args.size)
     elif not args.fit_domain and np.all(P >= -1) and np.all(P <= 1):
         grid = Grid.cube(dims)
     else:
         grid = T.default_grid(dims, target_bounds=(P.min(0), P.max(0)))
-    return grid, T.target_from_points(P, N, path.stem, grid, n=args.samples, seed=args.seed, source=str(path))
+    return grid, T.target_from_points(P, path.stem, grid, n=args.samples, seed=args.seed, source=str(path),
+                                      inside=args.inside, inside_radius=args.inside_radius)
 
 
 def main():
@@ -636,9 +686,14 @@ def main():
     ap.add_argument("--sampson-iters", type=int, default=100)
     ap.add_argument("--disp-penalty", type=float, default=1e-3, help="warp: lambda * mean(D^2)")
     ap.add_argument("--shell-weight", type=float, default=1e-2,
-                    help="warp Sampson: weight of the sign term at points 0.25-1.5 cells off the target (0 = off)")
-    ap.add_argument("--normal-weight", type=float, default=1.0)
+                    help="Sampson: weight of the sign term at points 0.25-1.5 cells off the target (0 = off)")
+    ap.add_argument("--off-weight", type=float, default=1.0,
+                    help="closed form: weight of f = signed distance at points 0.25-1.5 cells off the target")
     ap.add_argument("--smooth-weight", type=float, default=0.01)
+    ap.add_argument("--inside", default="rays", choices=["rays", "flood"],
+                    help="point clouds: inside/outside test (see inside_outside.py)")
+    ap.add_argument("--inside-radius", type=float,
+                    help="its shell radius in point spacings (default 3 for rays, 5 for flood)")
     ap.add_argument("--anchor-weights", type=float, nargs="+", default=[0.03, 0.3],
                     help="stage 1: pulls towards the signed-distance estimate (one fit each, the best is kept)")
     ap.add_argument("--seed", type=int, default=0)
@@ -653,11 +708,11 @@ def main():
         return
     if not (args.function or args.points):
         raise SystemExit("give --function or --points (see --list)")
-    cfg = GridFitConfig(model=args.model, method=args.method, depth=args.depth, normal_weight=args.normal_weight,
+    cfg = GridFitConfig(model=args.model, method=args.method, depth=args.depth, off_weight=args.off_weight,
                         smooth_weight=args.smooth_weight, anchor_weights=tuple(args.anchor_weights),
-                        sampson_iters=args.sampson_iters,
-                        disp_penalty=args.disp_penalty, shell_weight=args.shell_weight, iters=args.iters, lr=args.lr, samples=args.samples,
-                        seed=args.seed)
+                        sampson_iters=args.sampson_iters, disp_penalty=args.disp_penalty,
+                        shell_weight=args.shell_weight, iters=args.iters, lr=args.lr, samples=args.samples,
+                        inside=args.inside, inside_radius=args.inside_radius, seed=args.seed)
     grid, target = make_grid_and_target(args)
     model = GridModel(grid, args.model)
     print(f"target: {target.describe()}")
